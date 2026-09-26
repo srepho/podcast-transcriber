@@ -31,6 +31,15 @@ pub struct Alias {
 pub struct Vocab {
     pub terms: Vec<Term>,
     pub aliases: Vec<Alias>,
+    /// Parallel to `terms`: matching data computed once rather than per transcript segment.
+    prepared: Vec<PreparedTerm>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PreparedTerm {
+    key: Prepared,
+    /// Normalized surname, for the surname check.
+    last: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -97,6 +106,14 @@ impl Vocab {
         if key.is_empty() || self.terms.iter().any(|t| t.key == key) {
             return;
         }
+        self.prepared.push(PreparedTerm {
+            key: Prepared::new(key.clone()),
+            last: canonical
+                .split_whitespace()
+                .last()
+                .map(normalize_word)
+                .unwrap_or_default(),
+        });
         self.terms.push(Term {
             canonical: canonical.to_string(),
             key,
@@ -203,34 +220,45 @@ impl Vocab {
         // 2. fuzzy terms. Score every (term, window) pair, then accept the best-scoring
         // non-overlapping matches globally, so an exact "Anthony Slater" always beats a
         // near-miss "Anthony Carter" and a full "Jaren Jackson Jr" beats a bare "Jackson".
+        // Window strings and term keys are prepared once; cheap upper bounds on the score
+        // (length, then letter counts) skip the string metrics for pairs that cannot match.
+        let max_width = self.terms.iter().map(|t| t.words + 2).max().unwrap_or(0);
+        let windows: Vec<Vec<Option<Prepared>>> = (0..=max_width.min(norm.len().max(1)))
+            .map(|width| {
+                (0..norm.len().saturating_sub(width.max(1) - 1))
+                    .map(|i| {
+                        (width > 0 && window_ok(i, width))
+                            .then(|| Prepared::new(norm[i..i + width].concat()))
+                    })
+                    .collect()
+            })
+            .collect();
         let mut cands: Vec<(f64, usize, usize, usize)> = vec![]; // (score, start, width, term)
-        for (ti, term) in self.terms.iter().enumerate() {
+        for (ti, (term, prepared)) in self.terms.iter().zip(&self.prepared).enumerate() {
             if term.key.len() < 4 {
                 continue;
             }
+            let (key, last_term) = (&prepared.key, &prepared.last);
+            let req = required(threshold, &term.key);
             let max_w = (term.words + 2).min(norm.len().max(1));
             for width in 1..=max_w {
-                for i in 0..norm.len().saturating_sub(width - 1) {
-                    if !window_ok(i, width) {
+                for (i, window) in windows[width].iter().enumerate() {
+                    let Some(window) = window else {
+                        continue;
+                    };
+                    if score_bound(window, key, req) < req {
                         continue;
                     }
-                    let candidate: String = norm[i..i + width].concat();
-                    let mut score = match_score(&candidate, &term.key);
-                    if score >= required(threshold, &term.key) && width == term.words && width > 1 {
+                    let mut score = prepared_score(window, key);
+                    if score >= req && width == term.words && width > 1 {
                         // Same word count: the surname must hold up on its own, otherwise a
                         // shared first name carries a wrong surname over the line.
                         let last_cand = &norm[i + width - 1];
-                        let last_term = term
-                            .canonical
-                            .split_whitespace()
-                            .last()
-                            .map(normalize_word)
-                            .unwrap_or_default();
-                        if match_score(last_cand, &last_term) < 0.7 {
+                        if match_score(last_cand, last_term) < 0.7 {
                             score = 0.0;
                         }
                     }
-                    if score >= required(threshold, &term.key) {
+                    if score >= req {
                         cands.push((score, i, width, ti));
                     }
                 }
@@ -311,16 +339,132 @@ fn fold_phonetic(s: &str) -> String {
     out
 }
 
-/// 0..=1 similarity between a normalized transcript fragment and a vocab key.
-fn match_score(candidate: &str, key: &str) -> f64 {
-    if candidate == key {
+/// A normalized string with its phonetic fold and letter counts, computed once.
+#[derive(Debug, Clone, PartialEq)]
+struct Prepared {
+    raw: String,
+    folded: String,
+    raw_counts: LetterCounts,
+    folded_counts: LetterCounts,
+}
+
+impl Prepared {
+    fn new(raw: String) -> Prepared {
+        let folded = fold_phonetic(&raw);
+        Prepared {
+            raw_counts: LetterCounts::of(&raw),
+            folded_counts: LetterCounts::of(&folded),
+            raw,
+            folded,
+        }
+    }
+}
+
+/// Character histogram (a-z, 0-9, everything else shared). Merging characters into one
+/// bucket can only shrink the distance below, so it stays a valid lower bound.
+#[derive(Debug, Clone, PartialEq)]
+struct LetterCounts {
+    counts: [u16; 37],
+    /// Which buckets are non-empty: a one-instruction first pass over the same bound.
+    present: u64,
+    chars: usize,
+}
+
+impl LetterCounts {
+    fn of(s: &str) -> LetterCounts {
+        let mut counts = [0u16; 37];
+        let mut chars = 0;
+        for c in s.chars() {
+            let bucket = match c {
+                'a'..='z' => c as usize - 'a' as usize,
+                '0'..='9' => 26 + c as usize - '0' as usize,
+                _ => 36,
+            };
+            counts[bucket] = counts[bucket].saturating_add(1);
+            chars += 1;
+        }
+        let present = counts
+            .iter()
+            .enumerate()
+            .filter(|(_, &n)| n > 0)
+            .fold(0u64, |mask, (i, _)| mask | 1 << i);
+        LetterCounts {
+            counts,
+            present,
+            chars,
+        }
+    }
+
+    /// Weaker, cheaper form of `levenshtein_bound`: every letter present on only one side
+    /// contributes at least one to the histogram distance.
+    fn presence_bound(&self, other: &LetterCounts) -> f64 {
+        let longest = self.chars.max(other.chars);
+        if longest == 0 {
+            return 1.0;
+        }
+        let l1 = (self.present ^ other.present).count_ones();
+        1.0 - f64::from(l1.div_ceil(2)) / longest as f64
+    }
+
+    /// Upper bound on `strsim::normalized_levenshtein`: each edit changes the histogram's
+    /// L1 distance by at most two, so the edit distance is at least half of it.
+    fn levenshtein_bound(&self, other: &LetterCounts) -> f64 {
+        let longest = self.chars.max(other.chars);
+        if longest == 0 {
+            return 1.0;
+        }
+        let l1: u32 = self
+            .counts
+            .iter()
+            .zip(&other.counts)
+            .map(|(&a, &b)| u32::from(a.abs_diff(b)))
+            .sum();
+        1.0 - f64::from(l1.div_ceil(2)) / longest as f64
+    }
+}
+
+/// Never below `prepared_score(candidate, key)`, and much cheaper. `pair_score` exceeds
+/// normalized Levenshtein by at most 0.10, and the length penalty is exact.
+fn score_bound(candidate: &Prepared, key: &Prepared, min_score: f64) -> f64 {
+    if candidate.raw == key.raw {
         return 1.0;
     }
-    if candidate.is_empty() {
+    let (a, b) = (candidate.raw.len() as f64, key.raw.len() as f64);
+    if candidate.raw.is_empty() || a < b * 0.6 || a > b * 1.4 {
+        return 0.0;
+    }
+    let len_penalty = 0.5 * (a - b).abs() / b.max(1.0);
+    let margin = 0.10 - len_penalty + 1e-9;
+    let presence = candidate
+        .raw_counts
+        .presence_bound(&key.raw_counts)
+        .max(candidate.folded_counts.presence_bound(&key.folded_counts));
+    if presence + margin < min_score {
+        return presence + margin;
+    }
+    let lev = candidate.raw_counts.levenshtein_bound(&key.raw_counts).max(
+        candidate
+            .folded_counts
+            .levenshtein_bound(&key.folded_counts),
+    );
+    // A small margin keeps float rounding from ever pruning a true match.
+    lev + margin
+}
+
+/// 0..=1 similarity between a normalized transcript fragment and a vocab key.
+fn match_score(candidate: &str, key: &str) -> f64 {
+    prepared_score(&Prepared::new(candidate.into()), &Prepared::new(key.into()))
+}
+
+fn prepared_score(candidate: &Prepared, key: &Prepared) -> f64 {
+    if candidate.raw == key.raw {
+        return 1.0;
+    }
+    if candidate.raw.is_empty() {
         return 0.0;
     }
     // A 4-letter fragment should never become a 20-letter name, nor vice versa.
-    let (a, b) = (candidate.len() as f64, key.len() as f64);
+    let (a, b) = (candidate.raw.len() as f64, key.raw.len() as f64);
     if a < b * 0.6 || a > b * 1.4 {
         return 0.0;
     }
@@ -336,8 +480,8 @@ fn match_score(candidate: &str, key: &str) -> f64 {
             lev.min(jw)
         }
     };
-    let raw = pair_score(candidate, key);
-    let folded = pair_score(&fold_phonetic(candidate), &fold_phonetic(key));
+    let raw = pair_score(&candidate.raw, &key.raw);
+    let folded = pair_score(&candidate.folded, &key.folded);
     // Extra or missing letters (a swallowed neighbouring word) cost proportionally.
     let len_penalty = 0.5 * (a - b).abs() / b.max(1.0);
     (raw.max(folded) - len_penalty).clamp(0.0, 1.0)
@@ -594,6 +738,49 @@ pub mod nba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Invariant: score_bound never falls below the real score, so pruning can't change the
+    // matcher's output. Checked over pseudo-random strings biased toward near-misses, using
+    // letters the phonetic fold rewrites (c/k/y/j/h/ph/ch/sh/th/z/w) and non-ASCII buckets.
+    #[test]
+    fn score_bound_never_undercuts_the_real_score() {
+        let alphabet: Vec<char> = "abcdehijkmnoprstuvwyzq0ø".chars().collect();
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        for _ in 0..5_000 {
+            let key: String = (0..4 + next(12))
+                .map(|_| alphabet[next(alphabet.len())])
+                .collect();
+            let mut cand: Vec<char> = key.chars().collect();
+            for _ in 0..next(5) {
+                let at = next(cand.len() + 1);
+                match next(3) {
+                    0 if at < cand.len() => cand[at] = alphabet[next(alphabet.len())],
+                    1 => cand.insert(at, alphabet[next(alphabet.len())]),
+                    _ if at < cand.len() && cand.len() > 1 => {
+                        cand.remove(at);
+                    }
+                    _ => {}
+                }
+            }
+            let cand: String = cand.into_iter().collect();
+            let (c, k) = (Prepared::new(cand.clone()), Prepared::new(key.clone()));
+            let score = prepared_score(&c, &k);
+            for min in [0.5, 0.8, 0.85, 0.95] {
+                let bound = score_bound(&c, &k, min);
+                // Below `min` the bound may stop early, but it must never hide a passing score.
+                assert!(
+                    bound >= score || (bound < min && score < min),
+                    "{cand:?} vs {key:?}: bound {bound} < score {score} (min {min})"
+                );
+            }
+        }
+    }
 
     fn v() -> Vocab {
         Vocab::parse(
