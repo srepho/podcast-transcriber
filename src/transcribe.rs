@@ -30,6 +30,13 @@ pub struct Transcript {
     pub model: String,
     pub language: Option<String>,
     pub duration_secs: f64,
+    /// Unknown for legacy transcripts; never inferred from publication or file mtime.
+    #[serde(default)]
+    pub downloaded_at: Option<String>,
+    #[serde(default)]
+    pub transcribed_at: Option<String>,
+    #[serde(default)]
+    pub producer_version: Option<String>,
     /// The whisper initial prompt that was used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
@@ -272,6 +279,9 @@ mod tests {
             model: "base.en".into(),
             language: Some("en".into()),
             duration_secs: 3.5,
+            downloaded_at: None,
+            transcribed_at: None,
+            producer_version: None,
             prompt: None,
             corrections: vec![],
             segments: vec![

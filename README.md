@@ -87,6 +87,11 @@ for keys named like `name` or `player`) to feed `vocab import` with historical p
 
 ## Commands
 
+For a bounded prediction-model evidence sample, see [the research pilot guide](docs/RESEARCH_PILOT.md).
+It covers timestamped provenance, raw/corrected evidence, manual claim review and strict
+decision-time filtering. The optional exporter uses Python's standard library; collection
+and transcription remain in the Rust binary.
+
 | Command | Purpose |
 |---|---|
 | `init`, `add`, `remove`, `feeds` | manage subscriptions |
@@ -96,6 +101,7 @@ for keys named like `name` or `player`) to feed `vocab import` with historical p
 | `retry` | re-queue failed episodes |
 | `model list`, `model download <name>` | whisper models (auto-downloaded on first use) |
 | `vocab ...`, `correct <feed>` | name correction |
+| `collect <feed> --title TEXT --limit 5` | collect a bounded sample without processing unrelated queued work |
 | `file <audio>` | transcribe a local file with no feed |
 
 Every command takes `--config <path>` (default `./config.yaml`) and `--limit N` where

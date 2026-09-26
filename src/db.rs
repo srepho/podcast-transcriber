@@ -134,14 +134,24 @@ impl Db {
         }
         // Recreate indexes after dropping the legacy table (which owned their names).
         tx.execute_batch(SCHEMA)?;
+        let has_download_time = {
+            let mut stmt = tx.prepare("PRAGMA table_info(episodes)")?;
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            names.iter().any(|n| n == "downloaded_at")
+        };
+        if !has_download_time {
+            tx.execute_batch("ALTER TABLE episodes ADD COLUMN downloaded_at TEXT;")?;
+        }
         tx.commit()?;
         Ok(())
     }
 
     #[cfg(test)]
     pub fn open_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
+        let mut conn = Connection::open_in_memory()?;
+        Self::initialize(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -196,7 +206,7 @@ impl Db {
 
     pub fn set_audio_path(&self, feed_name: &str, guid: &str, path: &Path) -> Result<()> {
         self.conn.execute(
-            "UPDATE episodes SET audio_path=?1, updated_at=?2 WHERE guid=?3 AND feed_name=?4",
+            "UPDATE episodes SET audio_path=?1, updated_at=?2, downloaded_at=?2 WHERE guid=?3 AND feed_name=?4",
             params![
                 path.to_string_lossy(),
                 Utc::now().to_rfc3339(),
@@ -205,6 +215,14 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn downloaded_at(&self, feed_name: &str, guid: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT downloaded_at FROM episodes WHERE feed_name=?1 AND guid=?2",
+            params![feed_name, guid],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn set_transcript_path(&self, feed_name: &str, guid: &str, path: &Path) -> Result<()> {
@@ -352,6 +370,9 @@ mod tests {
         db.insert(&ep("a", Status::New)).unwrap();
         db.set_audio_path("f", "a", Path::new("/tmp/a.mp3"))
             .unwrap();
+        assert!(
+            DateTime::parse_from_rfc3339(&db.downloaded_at("f", "a").unwrap().unwrap()).is_ok()
+        );
         db.set_status("f", "a", Status::Downloaded, None).unwrap();
         let got = db.get("f", "a").unwrap().unwrap();
         assert_eq!(got.status, Status::Downloaded);
@@ -431,6 +452,7 @@ mod tests {
             .unwrap();
         drop(old);
         let db = Db::open(&path).unwrap();
+        assert_eq!(db.downloaded_at("f", "shared").unwrap(), None);
         assert_eq!(db.get("f", "shared").unwrap().unwrap(), original);
         let timestamps: (String, String) = db
             .conn

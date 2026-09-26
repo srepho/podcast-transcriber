@@ -99,6 +99,14 @@ enum Cmd {
         #[arg(short, long)]
         limit: Option<usize>,
     },
+    /// Collect a bounded research sample from already discovered episodes.
+    Collect {
+        feed: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
     /// Pipeline counts per status.
     Status {
         #[arg(short, long)]
@@ -351,6 +359,12 @@ fn run() -> Result<()> {
             println!("run complete");
         }
 
+        Cmd::Collect { feed, title, limit } => {
+            require_feed(&settings, Some(&feed))?;
+            let db = Db::open(&settings.db_path())?;
+            pipeline::collect(&settings, &db, &feed, &title, limit)?;
+        }
+
         Cmd::Status { feed } => {
             require_feed(&settings, feed.as_deref())?;
             let db = Db::open(&settings.db_path())?;
@@ -458,6 +472,9 @@ fn run() -> Result<()> {
                 model: engine.model_name.clone(),
                 language,
                 duration_secs: duration,
+                downloaded_at: None,
+                transcribed_at: Some(Utc::now().to_rfc3339()),
+                producer_version: Some(env!("CARGO_PKG_VERSION").into()),
                 prompt: None,
                 corrections: vec![],
                 segments,

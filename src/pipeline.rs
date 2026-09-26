@@ -235,11 +235,15 @@ pub fn download_pending(
     only: Option<&str>,
     limit: Option<usize>,
 ) -> Result<Batch<usize>> {
-    let client = crate::http::client(settings.download_timeout_secs)?;
     let mut eps = db.list(Some(Status::New), only)?;
     if let Some(n) = limit {
         eps.truncate(n);
     }
+    download_episodes(settings, db, eps)
+}
+
+fn download_episodes(settings: &Settings, db: &Db, eps: Vec<Episode>) -> Result<Batch<usize>> {
+    let client = crate::http::client(settings.download_timeout_secs)?;
     let mut ok = 0;
     let mut failed = 0;
     for (i, ep) in eps.iter().enumerate() {
@@ -283,6 +287,10 @@ pub fn transcribe_pending(
     if let Some(n) = limit {
         eps.truncate(n);
     }
+    transcribe_episodes(settings, db, eps)
+}
+
+fn transcribe_episodes(settings: &Settings, db: &Db, eps: Vec<Episode>) -> Result<Batch<usize>> {
     if eps.is_empty() {
         return Ok(Batch {
             value: 0,
@@ -342,6 +350,56 @@ pub fn transcribe_pending(
     Ok(Batch { value: ok, failed })
 }
 
+/// A bounded sample from already discovered episodes; unrelated queued work is untouched.
+pub fn collect(settings: &Settings, db: &Db, feed: &str, title: &str, limit: usize) -> Result<()> {
+    anyhow::ensure!(
+        (1..=10).contains(&limit),
+        "pilot collection limit must be 1..10"
+    );
+    let mut selected = db.list(None, Some(feed))?;
+    selected.reverse();
+    selected.retain(|e| e.title.to_lowercase().contains(&title.to_lowercase()));
+    selected.truncate(limit);
+    anyhow::ensure!(
+        !selected.is_empty(),
+        "no matching discovered episodes; refresh the feed first"
+    );
+    for ep in &selected {
+        eprintln!("pilot sample: {} ({})", ep.title, ep.status);
+        if matches!(ep.status, Status::Skipped | Status::Failed) {
+            let status = if ep.audio_path.as_ref().is_some_and(|p| p.exists()) {
+                Status::Downloaded
+            } else {
+                Status::New
+            };
+            db.set_status(feed, &ep.guid, status, None)?;
+        }
+    }
+    let ids: std::collections::HashSet<_> = selected.iter().map(|e| e.guid.as_str()).collect();
+    let queued = db
+        .list(Some(Status::New), Some(feed))?
+        .into_iter()
+        .filter(|e| ids.contains(e.guid.as_str()))
+        .collect();
+    let downloads = download_episodes(settings, db, queued)?;
+    let ready = db
+        .list(Some(Status::Downloaded), Some(feed))?
+        .into_iter()
+        .filter(|e| ids.contains(e.guid.as_str()))
+        .collect();
+    let transcripts = transcribe_episodes(settings, db, ready)?;
+    eprintln!(
+        "pilot: {} selected, {} downloaded, {} transcribed, {} failed",
+        selected.len(),
+        downloads.value,
+        transcripts.value,
+        downloads.failed + transcripts.failed
+    );
+    downloads.check("pilot download")?;
+    transcripts.check("pilot transcription")?;
+    Ok(())
+}
+
 fn transcribe_one(
     settings: &Settings,
     db: &Db,
@@ -399,6 +457,9 @@ fn transcribe_one(
         model: engine.model_name.clone(),
         language,
         duration_secs: duration,
+        downloaded_at: db.downloaded_at(&ep.feed_name, &ep.guid)?,
+        transcribed_at: Some(Utc::now().to_rfc3339()),
+        producer_version: Some(env!("CARGO_PKG_VERSION").into()),
         prompt: Some(prompt),
         corrections: vec![],
         segments,
@@ -428,6 +489,22 @@ fn transcribe_one(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn collect_leaves_unrelated_queue_untouched_and_enforces_bound() {
+        let db = Db::open_memory().unwrap();
+        let mut episodes = parsed(3);
+        episodes.episodes[0].title = "Long outlook".into();
+        ingest(&db, &feed(), &episodes, 3).unwrap();
+        for episode in &episodes.episodes[1..] {
+            db.set_status("cast", &episode.guid, Status::Transcribed, None)
+                .unwrap();
+        }
+        collect(&Settings::default(), &db, "cast", "Episode", 2).unwrap();
+        assert_eq!(db.list(Some(Status::New), Some("cast")).unwrap().len(), 1);
+        assert!(collect(&Settings::default(), &db, "cast", "Episode", 11).is_err());
+        assert!(collect(&Settings::default(), &db, "cast", "Episode", 0).is_err());
+    }
 
     #[test]
     fn refresh_continues_after_failure_and_reports_partial_success() {
