@@ -21,6 +21,9 @@ pub fn serve(responses: Vec<(String, Duration)>) -> (String, JoinHandle<()>) {
                     Err(e) => panic!("accept: {e}"),
                 }
             };
+            // BSD/macOS accepted sockets inherit the listener's non-blocking mode, which
+            // made the read below fail with WouldBlock whenever the request arrived late.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

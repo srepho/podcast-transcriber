@@ -46,25 +46,20 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// Re-run vocabulary correction from the raw whisper text.
+    /// Re-run vocabulary correction from the raw whisper text, across segment boundaries.
     pub fn apply_vocab(&mut self, vocab: &crate::vocab::Vocab, threshold: f64) {
-        self.corrections.clear();
-        for seg in &mut self.segments {
-            let raw = seg.raw_text.clone().unwrap_or_else(|| seg.text.clone());
-            let (fixed, corr) = vocab.correct(&raw, threshold);
+        let raws: Vec<String> = self
+            .segments
+            .iter()
+            .map(|seg| seg.raw_text.clone().unwrap_or_else(|| seg.text.clone()))
+            .collect();
+        let texts: Vec<&str> = raws.iter().map(String::as_str).collect();
+        let (fixed, corrections) = vocab.correct_segments(&texts, threshold);
+        for ((seg, raw), fixed) in self.segments.iter_mut().zip(raws).zip(fixed) {
             seg.raw_text = if fixed != raw { Some(raw) } else { None };
             seg.text = fixed;
-            for c in corr {
-                match self
-                    .corrections
-                    .iter_mut()
-                    .find(|x| x.from == c.from && x.to == c.to)
-                {
-                    Some(x) => x.count += c.count,
-                    None => self.corrections.push(c),
-                }
-            }
         }
+        self.corrections = corrections;
     }
 
     pub fn read_json(path: &Path) -> Result<Transcript> {

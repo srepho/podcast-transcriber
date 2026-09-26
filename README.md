@@ -67,8 +67,10 @@ Three layers address this:
    transcription every name is fuzzy-matched against the text (letters-only comparison with
    a phonetic fold, so y/j and c/k confusions count as equal) and mangled spellings are
    replaced. Guard rails keep it from touching ordinary prose: a match must contain a
-   capitalized word, cannot start or end on a stopword, cannot cross a sentence boundary,
-   and for two-word names the surname must hold up on its own.
+   capitalized word, cannot start or end on a stopword (unless the name itself does, as in
+   "Will Hardy"), cannot cross a sentence boundary, and for two-word names the surname must
+   hold up on its own. Matching runs across whisper's segment boundaries, so a name split
+   between two segments is still found; the corrected name goes in the first segment.
 3. **Aliases.** For recurring garbles the fuzzy matcher can't reach, add an explicit line:
    `nicole yokage => Nikola Jokić`.
 

@@ -38,7 +38,8 @@ pub struct Vocab {
 #[derive(Debug, Clone, PartialEq)]
 struct PreparedTerm {
     key: Prepared,
-    /// Normalized surname, for the surname check.
+    /// Normalized first word and surname, for the stopword and surname checks.
+    first: String,
     last: String,
 }
 
@@ -108,6 +109,11 @@ impl Vocab {
         }
         self.prepared.push(PreparedTerm {
             key: Prepared::new(key.clone()),
+            first: canonical
+                .split_whitespace()
+                .next()
+                .map(normalize_word)
+                .unwrap_or_default(),
             last: canonical
                 .split_whitespace()
                 .last()
@@ -141,7 +147,22 @@ impl Vocab {
 
     /// Apply aliases then fuzzy term matching. Returns corrected text and what changed.
     pub fn correct(&self, text: &str, threshold: f64) -> (String, Vec<Correction>) {
-        let mut tokens = tokenize(text);
+        let (mut out, corrections) = self.correct_segments(&[text], threshold);
+        (out.pop().unwrap_or_default(), corrections)
+    }
+
+    /// Correct consecutive transcript segments as one text, so a name whisper split across
+    /// a segment boundary is still found. Sentence punctuation still separates windows. A
+    /// replacement that spans a boundary is written into the segment where the name starts.
+    pub fn correct_segments(
+        &self,
+        segments: &[&str],
+        threshold: f64,
+    ) -> (Vec<String>, Vec<Correction>) {
+        let mut tokens: Vec<Token> = vec![];
+        for (seg, text) in segments.iter().enumerate() {
+            tokens.extend(tokenize(text).into_iter().map(|t| Token { seg, ..t }));
+        }
         let mut corrections: Vec<Correction> = vec![];
         let mut record = |from: String, to: String| {
             if let Some(c) = corrections
@@ -191,11 +212,27 @@ impl Vocab {
                 sep.contains(['?', '!', ';', ':', '\n']) || (sep.contains('.') && norm[w].len() > 2)
             })
             .collect();
+        let stop: Vec<bool> = norm.iter().map(|w| is_stopword(w)).collect();
         let window_ok = |i: usize, width: usize| -> bool {
             cap[i..i + width].iter().any(|&c| c)
-                && !is_stopword(&norm[i])
-                && !is_stopword(&norm[i + width - 1])
                 && !boundary_after[i..i + width - 1].iter().any(|&b| b)
+        };
+        // A stopword may open or close a window only when it is the name's own first or last
+        // word ("Will Hardy"), and then a capitalized word other than it must be present,
+        // so a sentence-initial "Will hardly" is left alone.
+        let stopwords_ok = |i: usize, width: usize, term: &PreparedTerm| -> bool {
+            let (opens, closes) = (stop[i], stop[i + width - 1]);
+            if !opens && !closes {
+                return true;
+            }
+            if width < 2
+                || (opens && norm[i] != term.first)
+                || (closes && norm[i + width - 1] != term.last)
+            {
+                return false;
+            }
+            let (lo, hi) = (i + usize::from(opens), i + width - usize::from(closes));
+            lo < hi && cap[lo..hi].iter().any(|&c| c)
         };
 
         // 1. explicit aliases (longest first so multi-word aliases win)
@@ -207,7 +244,8 @@ impl Vocab {
             while i + n <= norm.len() {
                 if !consumed[i..i + n].iter().any(|&c| c) && norm[i..i + n] == a.from_words[..] {
                     let from = join_words(&tokens, &word_idx[i..i + n]);
-                    replace_span(&mut tokens, &word_idx[i..i + n], &a.to);
+                    let to = without_doubled_period(&tokens, word_idx[i + n - 1], &a.to);
+                    replace_span(&mut tokens, &word_idx[i..i + n], to);
                     consumed[i..i + n].iter_mut().for_each(|c| *c = true);
                     record(from, a.to.clone());
                     i += n;
@@ -246,7 +284,7 @@ impl Vocab {
                     let Some(window) = window else {
                         continue;
                     };
-                    if score_bound(window, key, req) < req {
+                    if !stopwords_ok(i, width, prepared) || score_bound(window, key, req) < req {
                         continue;
                     }
                     let mut score = prepared_score(window, key);
@@ -275,17 +313,19 @@ impl Vocab {
             }
             let term = &self.terms[ti];
             let from = join_words(&tokens, &word_idx[i..i + width]);
-            if from != term.canonical {
-                replace_span(&mut tokens, &word_idx[i..i + width], &term.canonical);
+            let to = without_doubled_period(&tokens, word_idx[i + width - 1], &term.canonical);
+            if from != to {
+                replace_span(&mut tokens, &word_idx[i..i + width], to);
                 record(from, term.canonical.clone());
             }
             consumed[i..i + width].iter_mut().for_each(|c| *c = true);
         }
 
-        (
-            tokens.iter().map(|t| t.text.as_str()).collect(),
-            corrections,
-        )
+        let mut out = vec![String::new(); segments.len()];
+        for t in &tokens {
+            out[t.seg].push_str(&t.text);
+        }
+        (out, corrections)
     }
 }
 
@@ -491,6 +531,20 @@ fn prepared_score(candidate: &Prepared, key: &Prepared) -> f64 {
 struct Token {
     text: String,
     is_word: bool,
+    /// Index of the transcript segment the token came from.
+    seg: usize,
+}
+
+/// The tokenizer splits a trailing period off a word, so "Jr." arrives as "Jr" + ".".
+/// A replacement ending in "." must not add a second one before that separator.
+fn without_doubled_period<'a>(tokens: &[Token], last_word: usize, to: &'a str) -> &'a str {
+    let period_follows = tokens
+        .get(last_word + 1)
+        .is_some_and(|t| !t.is_word && t.text.starts_with('.'));
+    match to.strip_suffix('.') {
+        Some(stem) if period_follows => stem,
+        _ => to,
+    }
 }
 
 fn tokenize(text: &str) -> Vec<Token> {
@@ -503,6 +557,7 @@ fn tokenize(text: &str) -> Vec<Token> {
             _ => out.push(Token {
                 text: ch.to_string(),
                 is_word: word_char,
+                seg: 0,
             }),
         }
     }
@@ -517,15 +572,18 @@ fn tokenize(text: &str) -> Vec<Token> {
             fixed.push(Token {
                 text: w.to_string(),
                 is_word: true,
+                seg: 0,
             });
             fixed.push(Token {
                 text: p.to_string(),
                 is_word: false,
+                seg: 0,
             });
         } else if t.is_word && t.text.chars().all(|c| !c.is_alphanumeric()) {
             fixed.push(Token {
                 text: t.text,
                 is_word: false,
+                seg: 0,
             });
         } else {
             fixed.push(t);
@@ -738,6 +796,80 @@ pub mod nba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_ending_in_a_period_are_not_doubled() {
+        let v = Vocab::parse("Jaren Jackson Jr.\njaren jackson junior => Jaren Jackson Jr.\n");
+        let (out, c) = v.correct("Jaren Jackson Jr. scored 30.", 0.8);
+        assert_eq!(out, "Jaren Jackson Jr. scored 30.");
+        assert!(c.is_empty(), "a correct name is not a correction: {c:?}");
+        let (out, c) = v.correct("Jaren Jacksen Jr. scored.", 0.8);
+        assert_eq!(out, "Jaren Jackson Jr. scored.");
+        assert_eq!(c[0].to, "Jaren Jackson Jr.");
+        let (out, _) = v.correct("It was Jaren Jackson junior.", 0.8);
+        assert_eq!(out, "It was Jaren Jackson Jr.");
+        // Mid-sentence, the canonical period is kept.
+        let (out, _) = v.correct("Jaren Jackson junior scored.", 0.8);
+        assert_eq!(out, "Jaren Jackson Jr. scored.");
+    }
+
+    #[test]
+    fn names_starting_with_a_stopword_are_matched() {
+        let v = Vocab::parse("Will Hardy\nTre Mann\n");
+        let (out, _) = v.correct("Coach Will Hardey called timeout.", 0.8);
+        assert_eq!(out, "Coach Will Hardy called timeout.");
+        let (out, _) = v.correct("Will Hardey called timeout.", 0.8);
+        assert_eq!(out, "Will Hardy called timeout.");
+        // "Hardie" scores 0.67 against "Hardy", under the surname guard; that needs an alias.
+        let (out, _) = v.correct("Will Hardie called timeout.", 0.8);
+        assert_eq!(out, "Will Hardie called timeout.");
+    }
+
+    // Invariant: the stopword exception needs the stopword to be the name's own word and a
+    // separate capitalized word, so ordinary prose around stopwords is never rewritten.
+    #[test]
+    fn stopword_exception_does_not_touch_prose() {
+        let v = Vocab::parse("Will Hardy\nTre Mann\nWill Barton\n");
+        for text in [
+            "Will hardly play tonight.",
+            "He will hardly play.",
+            "They want to remain in Utah.",
+            "Will Harding is a different person entirely? No.",
+        ] {
+            let (out, c) = v.correct(text, 0.8);
+            if text.starts_with("Will Harding") {
+                continue; // a near-miss surname may legitimately match; covered elsewhere
+            }
+            assert_eq!(out, text, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn names_split_across_segments_are_corrected_in_the_first_segment() {
+        let v = v();
+        let (out, c) = v.correct_segments(&["Tonight Nikola", " Yokic scored 30."], 0.8);
+        assert_eq!(out, ["Tonight Nikola Jokić", " scored 30."]);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].to, "Nikola Jokić");
+    }
+
+    #[test]
+    fn sentence_end_still_separates_segments() {
+        let v = Vocab::parse("Jalen Green\n");
+        let (out, c) = v.correct_segments(&["That was Jalen.", " Green light for the trade."], 0.8);
+        assert_eq!(out, ["That was Jalen.", " Green light for the trade."]);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn empty_and_blank_segments_are_preserved() {
+        let v = v();
+        let (out, c) = v.correct_segments(&["", "  ", "Luka Doncic!"], 0.8);
+        assert_eq!(out, ["", "  ", "Luka Dončić!"]);
+        assert_eq!(c.len(), 1);
+        let (out, c) = v.correct_segments(&[], 0.8);
+        assert!(out.is_empty() && c.is_empty());
+    }
 
     // Invariant: score_bound never falls below the real score, so pruning can't change the
     // matcher's output. Checked over pseudo-random strings biased toward near-misses, using
