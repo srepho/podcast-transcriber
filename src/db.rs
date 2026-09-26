@@ -274,6 +274,21 @@ impl Db {
         Ok(n as usize)
     }
 
+    /// Newest publication date recorded for a feed, in any status.
+    pub fn latest_published(&self, feed_name: &str) -> Result<Option<DateTime<Utc>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT published FROM episodes WHERE feed_name=?1 AND published IS NOT NULL",
+        )?;
+        let dates = stmt.query_map(params![feed_name], |r| r.get::<_, String>(0))?;
+        let mut latest = None;
+        for date in dates {
+            if let Ok(d) = DateTime::parse_from_rfc3339(&date?) {
+                latest = latest.max(Some(d.with_timezone(&Utc)));
+            }
+        }
+        Ok(latest)
+    }
+
     /// Episodes filtered by status and/or feed. Ordered oldest-first by published date so
     /// pipelines work chronologically.
     pub fn list(&self, status: Option<Status>, feed_name: Option<&str>) -> Result<Vec<Episode>> {

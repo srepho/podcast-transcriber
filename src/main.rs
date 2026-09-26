@@ -4,6 +4,7 @@ mod db;
 mod download;
 mod feeds;
 mod http;
+mod lock;
 mod models;
 mod pipeline;
 #[cfg(test)]
@@ -124,6 +125,9 @@ enum Cmd {
     Retry {
         #[arg(short, long)]
         feed: Option<String>,
+        /// Delete any downloaded audio and fetch it again (for corrupt or non-audio files).
+        #[arg(long)]
+        redownload: bool,
     },
     /// Manage whisper models.
     Model {
@@ -222,6 +226,7 @@ fn run() -> Result<()> {
                 bail!("no feed named '{name}'");
             }
             settings.save(&cli.config)?;
+            let _lock = lock::acquire(&settings.data_dir)?;
             let n = Db::open(&settings.db_path())?.delete_feed(&name)?;
             println!("removed '{name}' and {n} episode records");
         }
@@ -250,6 +255,7 @@ fn run() -> Result<()> {
 
         Cmd::Refresh { feed } => {
             require_feed(&settings, feed.as_deref())?;
+            let _lock = lock::acquire(&settings.data_dir)?;
             let db = Db::open(&settings.db_path())?;
             let batch = pipeline::refresh(&settings, &db, feed.as_deref())?;
             for r in &batch.value {
@@ -290,6 +296,7 @@ fn run() -> Result<()> {
             if filter.is_empty() {
                 bail!("choose what to backfill: --all, --limit N, --since DATE, --until DATE, or --title TEXT (add --dry-run to preview)");
             }
+            let _lock = lock::acquire(&settings.data_dir)?;
             let db = Db::open(&settings.db_path())?;
             eprintln!("fetching full history for '{}'...", f.name);
             let selected = pipeline::backfill(&settings, &db, &f, &filter, dry_run)?;
@@ -310,6 +317,7 @@ fn run() -> Result<()> {
 
         Cmd::Download { feed, limit } => {
             require_feed(&settings, feed.as_deref())?;
+            let _lock = lock::acquire(&settings.data_dir)?;
             let db = Db::open(&settings.db_path())?;
             let n = pipeline::download_pending(&settings, &db, feed.as_deref(), limit)?;
             println!("downloaded {}, failed {}", n.value, n.failed);
@@ -318,6 +326,7 @@ fn run() -> Result<()> {
 
         Cmd::Transcribe { feed, limit } => {
             require_feed(&settings, feed.as_deref())?;
+            let _lock = lock::acquire(&settings.data_dir)?;
             let db = Db::open(&settings.db_path())?;
             let n = pipeline::transcribe_pending(&settings, &db, feed.as_deref(), limit)?;
             println!("transcribed {}, failed {}", n.value, n.failed);
@@ -326,6 +335,7 @@ fn run() -> Result<()> {
 
         Cmd::Run { feed, limit } => {
             require_feed(&settings, feed.as_deref())?;
+            let _lock = lock::acquire(&settings.data_dir)?;
             let db = Db::open(&settings.db_path())?;
             // Evaluate every stage even when an earlier stage has failed items.
             let refresh = pipeline::refresh(&settings, &db, feed.as_deref()).and_then(|batch| {
@@ -361,6 +371,7 @@ fn run() -> Result<()> {
 
         Cmd::Collect { feed, title, limit } => {
             require_feed(&settings, Some(&feed))?;
+            let _lock = lock::acquire(&settings.data_dir)?;
             let db = Db::open(&settings.db_path())?;
             pipeline::collect(&settings, &db, &feed, &title, limit)?;
         }
@@ -396,18 +407,16 @@ fn run() -> Result<()> {
             }
         }
 
-        Cmd::Retry { feed } => {
+        Cmd::Retry { feed, redownload } => {
+            let _lock = lock::acquire(&settings.data_dir)?;
             let db = Db::open(&settings.db_path())?;
-            let failed = db.list(Some(Status::Failed), feed.as_deref())?;
-            for e in &failed {
-                // If audio is already on disk, go straight back to transcription.
-                let back_to = match &e.audio_path {
-                    Some(p) if p.exists() => Status::Downloaded,
-                    _ => Status::New,
-                };
-                db.set_status(&e.feed_name, &e.guid, back_to, None)?;
-            }
-            println!("re-queued {}", failed.len());
+            let r = pipeline::retry_failed(&db, feed.as_deref(), redownload)?;
+            println!(
+                "re-queued {}: {} for transcription (audio kept), {} for download",
+                r.transcribe + r.download,
+                r.transcribe,
+                r.download
+            );
         }
 
         Cmd::Model { cmd } => match cmd {
@@ -438,9 +447,15 @@ fn run() -> Result<()> {
 
         Cmd::Correct { feed } => {
             require_feed(&settings, Some(&feed))?;
+            let _lock = lock::acquire(&settings.data_dir)?;
             let db = Db::open(&settings.db_path())?;
-            let (done, changed) = pipeline::correct_existing(&settings, &db, &feed)?;
-            println!("re-corrected {done} transcript(s), {changed} changed");
+            let batch = pipeline::correct_existing(&settings, &db, &feed)?;
+            let (done, changed) = batch.value;
+            println!(
+                "re-corrected {done} transcript(s), {changed} changed, {} failed",
+                batch.failed
+            );
+            batch.check("correct")?;
         }
 
         Cmd::File { path, out } => {

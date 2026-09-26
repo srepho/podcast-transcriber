@@ -36,7 +36,10 @@ before using an older binary with an upgraded database.
 ## Historical episodes
 
 Adding a feed only queues the newest `max_new_per_feed` (default 3) episodes; everything
-older is recorded as `skipped` so nothing is downloaded by surprise. Pull history on demand:
+older is recorded as `skipped` so nothing is downloaded by surprise. Later refreshes queue
+unseen episodes published after the newest one already known. Unseen episodes that are older
+(typically a feed migration that changed every GUID or audio URL) are recorded as `skipped`
+with a warning instead of queuing the whole back catalogue. Pull history on demand:
 
 ```bash
 podcast backfill myshow --dry-run --since 2025-01-01      # preview
@@ -98,7 +101,7 @@ and transcription remain in the Rust binary.
 | `refresh`, `download`, `transcribe`, `run` | the pipeline, separately or in one go |
 | `backfill <feed> ...` | queue older episodes |
 | `status`, `episodes [--status s] [--feed f]` | inspect the queue |
-| `retry` | re-queue failed episodes |
+| `retry [--redownload]` | re-queue failed episodes; `--redownload` deletes their audio first |
 | `model list`, `model download <name>` | whisper models (auto-downloaded on first use) |
 | `vocab ...`, `correct <feed>` | name correction |
 | `collect <feed> --title TEXT --limit 5` | collect a bounded sample without processing unrelated queued work |
@@ -106,6 +109,14 @@ and transcription remain in the Rust binary.
 
 Every command takes `--config <path>` (default `./config.yaml`) and `--limit N` where
 it makes sense, so `podcast run --limit 2` is a safe cron/launchd job.
+
+Commands that change state take a lock on `data/podcast.lock`, so an overlapping scheduled
+run exits with an error instead of processing the same episodes twice. `status` and
+`episodes` never wait for it.
+
+Downloads that are not audio (an HTML or JSON error page, an empty or truncated body) fail
+instead of being saved. If a file on disk is corrupt, `podcast retry --redownload` fetches it
+again; plain `retry` reuses audio already on disk.
 
 Pipeline commands exit nonzero when any attempted item fails, while retaining successful
 work. `run` attempts all three stages even if an earlier one reports failures. Inspect

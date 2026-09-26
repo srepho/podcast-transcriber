@@ -12,7 +12,12 @@ use crate::transcribe::{Engine, Transcript};
 use crate::vocab::{self, Vocab};
 
 /// Re-apply a feed's vocabulary to its existing transcripts (needs the .json format).
-pub fn correct_existing(settings: &Settings, db: &Db, feed_name: &str) -> Result<(usize, usize)> {
+/// One unreadable transcript is reported and counted, not fatal to the rest of the batch.
+pub fn correct_existing(
+    settings: &Settings,
+    db: &Db,
+    feed_name: &str,
+) -> Result<Batch<(usize, usize)>> {
     let vocab = Vocab::load(&settings.vocab_path(feed_name))?;
     if vocab.is_empty() {
         anyhow::bail!(
@@ -22,6 +27,7 @@ pub fn correct_existing(settings: &Settings, db: &Db, feed_name: &str) -> Result
     }
     let mut done = 0;
     let mut changed = 0;
+    let mut failed = 0;
     for ep in db.list(Some(Status::Transcribed), Some(feed_name))? {
         let Some(primary) = &ep.transcript_path else {
             continue;
@@ -31,23 +37,35 @@ pub fn correct_existing(settings: &Settings, db: &Db, feed_name: &str) -> Result
             eprintln!("  skipping {} (no .json transcript)", ep.title);
             continue;
         }
-        let mut t = Transcript::read_json(&json)?;
-        let before: usize = t.corrections.iter().map(|c| c.count).sum();
-        t.apply_vocab(&vocab, settings.correction_threshold);
-        let after: usize = t.corrections.iter().map(|c| c.count).sum();
-        let dir = json.parent().context("transcript has no parent dir")?;
-        let stem = json
-            .file_stem()
-            .context("bad transcript filename")?
-            .to_string_lossy()
-            .to_string();
-        t.write(dir, &stem, &settings.formats)?;
-        done += 1;
-        if after != before {
-            changed += 1;
+        let result = (|| -> Result<bool> {
+            let mut t = Transcript::read_json(&json)?;
+            let before: usize = t.corrections.iter().map(|c| c.count).sum();
+            t.apply_vocab(&vocab, settings.correction_threshold);
+            let after: usize = t.corrections.iter().map(|c| c.count).sum();
+            let dir = json.parent().context("transcript has no parent dir")?;
+            let stem = json
+                .file_stem()
+                .context("bad transcript filename")?
+                .to_string_lossy()
+                .to_string();
+            t.write(dir, &stem, &settings.formats)?;
+            Ok(after != before)
+        })();
+        match result {
+            Ok(was_changed) => {
+                done += 1;
+                changed += usize::from(was_changed);
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("  failed {}: {e:#}", ep.title);
+            }
         }
     }
-    Ok((done, changed))
+    Ok(Batch {
+        value: (done, changed),
+        failed,
+    })
 }
 
 /// Preserve successful work while reporting item failures to callers/schedulers.
@@ -86,25 +104,37 @@ fn to_episode(feed: &Feed, e: &FeedEpisode, status: Status) -> Episode {
 }
 
 /// Record a parsed feed's episodes. On a feed's first refresh only the newest `max_new` are
-/// queued; older ones are recorded as skipped. On later refreshes every unseen episode is queued
-/// (they are genuinely new). Pure over the DB so it's testable without the network.
+/// queued; older ones are recorded as skipped. On later refreshes an unseen episode is queued
+/// only if it was published after the newest episode already known. Older unseen episodes are
+/// what a feed migration looks like (new GUIDs or enclosure URLs for the same back catalogue),
+/// so they are recorded as skipped for `backfill` rather than downloaded wholesale. Undated
+/// episodes fall back to the `max_new` position cap. Pure over the DB, so it's testable offline.
 pub fn ingest(db: &Db, feed: &Feed, parsed: &ParsedFeed, max_new: usize) -> Result<RefreshReport> {
     let first_time = db.feed_count(&feed.name)? == 0;
+    let latest_known = db.latest_published(&feed.name)?;
     let mut queued = 0;
     let mut skipped = 0;
     // parsed.episodes is newest-first.
     for (i, e) in parsed.episodes.iter().enumerate() {
-        let status = if first_time && i >= max_new {
-            Status::Skipped
-        } else {
-            Status::New
+        let queue = match (first_time, e.published, latest_known) {
+            (true, _, _) => i < max_new,
+            (false, Some(published), Some(latest)) => published > latest,
+            (false, _, _) => i < max_new,
         };
+        let status = if queue { Status::New } else { Status::Skipped };
         if db.insert(&to_episode(feed, e, status))? {
             match status {
                 Status::New => queued += 1,
                 _ => skipped += 1,
             }
         }
+    }
+    if !first_time && skipped > 0 {
+        eprintln!(
+            "warning: feed '{}' has {skipped} unseen episode(s) older than its newest known one; \
+             recorded as skipped (queue them with `podcast backfill`)",
+            feed.name
+        );
     }
     Ok(RefreshReport {
         feed: feed.name.clone(),
@@ -350,6 +380,39 @@ fn transcribe_episodes(settings: &Settings, db: &Db, eps: Vec<Episode>) -> Resul
     Ok(Batch { value: ok, failed })
 }
 
+pub struct RetryReport {
+    pub transcribe: usize,
+    pub download: usize,
+}
+
+/// Re-queue failed episodes. Audio already on disk goes straight back to transcription unless
+/// `redownload` is set, in which case it is deleted so a corrupt file cannot fail forever.
+pub fn retry_failed(db: &Db, feed: Option<&str>, redownload: bool) -> Result<RetryReport> {
+    let mut report = RetryReport {
+        transcribe: 0,
+        download: 0,
+    };
+    for e in db.list(Some(Status::Failed), feed)? {
+        let audio = e.audio_path.as_ref().filter(|p| p.exists());
+        let status = match audio {
+            Some(path) if redownload => {
+                std::fs::remove_file(path)
+                    .with_context(|| format!("deleting {}", path.display()))?;
+                db.clear_audio_path(&e.feed_name, &e.guid)?;
+                Status::New
+            }
+            Some(_) => Status::Downloaded,
+            None => Status::New,
+        };
+        match status {
+            Status::Downloaded => report.transcribe += 1,
+            _ => report.download += 1,
+        }
+        db.set_status(&e.feed_name, &e.guid, status, None)?;
+    }
+    Ok(report)
+}
+
 /// A bounded sample from already discovered episodes; unrelated queued work is untouched.
 pub fn collect(settings: &Settings, db: &Db, feed: &str, title: &str, limit: usize) -> Result<()> {
     anyhow::ensure!(
@@ -414,7 +477,8 @@ fn transcribe_one(
     if !audio_path.exists() {
         anyhow::bail!("audio file missing: {}", audio_path.display());
     }
-    let pcm = crate::audio::decode_to_pcm(audio_path)?;
+    let pcm = crate::audio::decode_to_pcm(audio_path)
+        .context("decoding audio (if the file is corrupt: podcast retry --redownload)")?;
     let duration = crate::audio::duration_secs(&pcm);
     eprintln!("  audio: {:.1} min", duration / 60.0);
 
@@ -479,8 +543,13 @@ fn transcribe_one(
     db.set_transcript_path(&ep.feed_name, &ep.guid, &path)?;
     db.set_status(&ep.feed_name, &ep.guid, Status::Transcribed, None)?;
     if settings.delete_audio_after_transcribe {
-        let _ = std::fs::remove_file(audio_path);
-        db.clear_audio_path(&ep.feed_name, &ep.guid)?;
+        match std::fs::remove_file(audio_path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                // Keep the recorded path so the orphaned file stays discoverable.
+                eprintln!("  warning: could not delete {}: {e}", audio_path.display());
+            }
+            _ => db.clear_audio_path(&ep.feed_name, &ep.guid)?,
+        }
     }
     Ok(path)
 }
@@ -562,6 +631,165 @@ mod tests {
             "second audio"
         );
         server.join().unwrap();
+    }
+
+    // Invariant: after the first refresh, only episodes newer than anything already known are
+    // queued; a re-keyed back catalogue (same dates, new GUIDs) is recorded as skipped.
+    #[test]
+    fn later_ingest_skips_rekeyed_back_catalogue_but_queues_newer_episodes() {
+        let db = Db::open_memory().unwrap();
+        ingest(&db, &feed(), &parsed(10), 3).unwrap();
+        let mut migrated = parsed(12); // ep-11 and ep-12 are genuinely new
+        for e in &mut migrated.episodes {
+            e.guid = format!("cdn2-{}", e.guid);
+        }
+        let r = ingest(&db, &feed(), &migrated, 3).unwrap();
+        assert_eq!((r.queued, r.skipped), (2, 10));
+        let queued: Vec<_> = db
+            .list(Some(Status::New), None)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.guid.starts_with("cdn2-"))
+            .map(|e| e.guid)
+            .collect();
+        assert_eq!(queued, ["cdn2-ep-11", "cdn2-ep-12"]);
+    }
+
+    #[test]
+    fn later_ingest_of_undated_episodes_is_capped_by_position() {
+        let db = Db::open_memory().unwrap();
+        ingest(&db, &feed(), &parsed(2), 3).unwrap();
+        let mut undated = parsed(6);
+        for e in &mut undated.episodes {
+            e.guid = format!("undated-{}", e.guid);
+            e.published = None;
+        }
+        let r = ingest(&db, &feed(), &undated, 3).unwrap();
+        assert_eq!((r.queued, r.skipped), (3, 3));
+    }
+
+    #[test]
+    fn later_ingest_without_any_known_dates_uses_position_cap() {
+        let db = Db::open_memory().unwrap();
+        let mut first = parsed(1);
+        first.episodes[0].published = None;
+        ingest(&db, &feed(), &first, 3).unwrap();
+        // ep-1 is already known; of the four unseen, the newest three are queued.
+        let r = ingest(&db, &feed(), &parsed(5), 3).unwrap();
+        assert_eq!((r.queued, r.skipped), (3, 1));
+    }
+
+    fn failed_with_audio(db: &Db, dir: &std::path::Path, guid: &str, audio: Option<&str>) {
+        ingest(db, &feed(), &parsed(0), 3).unwrap();
+        let mut ep = to_episode(
+            &feed(),
+            &FeedEpisode {
+                guid: guid.into(),
+                title: guid.into(),
+                published: None,
+                audio_url: String::new(),
+                description: String::new(),
+            },
+            Status::Failed,
+        );
+        if let Some(body) = audio {
+            let path = dir.join(format!("{guid}.mp3"));
+            std::fs::write(&path, body).unwrap();
+            ep.audio_path = Some(path);
+        }
+        db.insert(&ep).unwrap();
+    }
+
+    #[test]
+    fn retry_keeps_audio_for_transcription_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        failed_with_audio(&db, dir.path(), "has-audio", Some("audio"));
+        failed_with_audio(&db, dir.path(), "no-audio", None);
+        let r = retry_failed(&db, None, false).unwrap();
+        assert_eq!((r.transcribe, r.download), (1, 1));
+        assert_eq!(
+            db.get("cast", "has-audio").unwrap().unwrap().status,
+            Status::Downloaded
+        );
+        assert!(dir.path().join("has-audio.mp3").exists());
+        assert_eq!(
+            db.get("cast", "no-audio").unwrap().unwrap().status,
+            Status::New
+        );
+    }
+
+    // Invariant: --redownload removes the suspect file and its recorded path, so the next
+    // download cannot silently reuse it.
+    #[test]
+    fn retry_redownload_deletes_audio_and_requeues_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        failed_with_audio(&db, dir.path(), "corrupt", Some("<html>error</html>"));
+        let r = retry_failed(&db, None, true).unwrap();
+        assert_eq!((r.transcribe, r.download), (0, 1));
+        let ep = db.get("cast", "corrupt").unwrap().unwrap();
+        assert_eq!(ep.status, Status::New);
+        assert!(ep.audio_path.is_none());
+        assert!(!dir.path().join("corrupt.mp3").exists());
+    }
+
+    #[test]
+    fn retry_redownload_with_stale_audio_path_requeues_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        failed_with_audio(&db, dir.path(), "gone", Some("audio"));
+        std::fs::remove_file(dir.path().join("gone.mp3")).unwrap();
+        let r = retry_failed(&db, None, true).unwrap();
+        assert_eq!((r.transcribe, r.download), (0, 1));
+    }
+
+    #[test]
+    fn correct_continues_past_an_unreadable_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            data_dir: dir.path().into(),
+            formats: vec!["json".into()],
+            ..Settings::default()
+        };
+        std::fs::create_dir_all(settings.vocab_path("cast").parent().unwrap()).unwrap();
+        std::fs::write(settings.vocab_path("cast"), "Nikola Jokić\n").unwrap();
+        let db = Db::open_memory().unwrap();
+        ingest(&db, &feed(), &parsed(2), 3).unwrap();
+        let good = Transcript {
+            feed: "cast".into(),
+            title: "Episode 2".into(),
+            guid: "ep-2".into(),
+            published: None,
+            audio_url: String::new(),
+            model: "test".into(),
+            language: None,
+            duration_secs: 5.0,
+            downloaded_at: None,
+            transcribed_at: None,
+            producer_version: None,
+            prompt: None,
+            corrections: vec![],
+            segments: vec![crate::transcribe::Segment {
+                start: 0.0,
+                end: 5.0,
+                text: "Nikola Yokic scored.".into(),
+                raw_text: None,
+            }],
+        };
+        let good_path = good.write(dir.path(), "good", &settings.formats).unwrap();
+        let bad_path = dir.path().join("bad.json");
+        std::fs::write(&bad_path, "{not json").unwrap();
+        for (guid, path) in [("ep-2", &good_path), ("ep-1", &bad_path)] {
+            db.set_transcript_path("cast", guid, path).unwrap();
+            db.set_status("cast", guid, Status::Transcribed, None)
+                .unwrap();
+        }
+        let batch = correct_existing(&settings, &db, "cast").unwrap();
+        assert_eq!((batch.value, batch.failed), ((1, 1), 1));
+        assert!(batch.check("correct").is_err());
+        let fixed = Transcript::read_json(&good_path).unwrap();
+        assert_eq!(fixed.segments[0].text, "Nikola Jokić scored.");
     }
 
     fn feed() -> Feed {
