@@ -63,6 +63,9 @@ pub struct Settings {
     pub formats: Vec<String>,
     /// When following feed pagination during backfill, stop after this many pages.
     pub max_feed_pages: usize,
+    /// Total request deadlines, including body transfer.
+    pub feed_timeout_secs: u64,
+    pub download_timeout_secs: u64,
     /// Similarity (0-1) a transcript fragment needs to be replaced by a vocabulary name.
     /// Lower = more aggressive. 0.8 is a good default; 0.75 catches badly split names.
     pub correction_threshold: f64,
@@ -78,6 +81,8 @@ impl Default for Settings {
             delete_audio_after_transcribe: false,
             formats: vec!["txt".into(), "srt".into(), "json".into()],
             max_feed_pages: 50,
+            feed_timeout_secs: 60,
+            download_timeout_secs: 3600,
             correction_threshold: 0.8,
             whisper: WhisperSettings::default(),
             feeds: vec![],
@@ -167,9 +172,18 @@ mod tests {
         assert_eq!(s.feeds.len(), 1);
         assert!(s.feeds[0].enabled);
         assert_eq!(s.whisper.model, "base.en");
+        assert_eq!(s.feed_timeout_secs, 60);
+        assert_eq!(s.download_timeout_secs, 3600);
         assert_eq!(
             s.model_path(),
             PathBuf::from("data/models/ggml-base.en.bin")
         );
+    }
+
+    #[test]
+    fn request_deadlines_are_configurable() {
+        let s: Settings =
+            serde_yaml::from_str("feed_timeout_secs: 5\ndownload_timeout_secs: 7200\n").unwrap();
+        assert_eq!((s.feed_timeout_secs, s.download_timeout_secs), (5, 7200));
     }
 }

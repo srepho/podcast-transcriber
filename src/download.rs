@@ -31,6 +31,17 @@ pub fn episode_basename(title: &str, published: Option<DateTime<Utc>>) -> String
     format!("{date}_{}", slug(title, 80))
 }
 
+/// The readable prefix is not an identity: titles, dates and feed slugs can collide.
+pub fn episode_filename(ep: &crate::db::Episode) -> String {
+    let identity = serde_json::to_vec(&(&ep.feed_name, &ep.guid)).expect("string serialization");
+    let digest = ring::digest::digest(&ring::digest::SHA256, &identity);
+    let suffix: String = digest.as_ref()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{}_{}", episode_basename(&ep.title, ep.published), suffix)
+}
+
 pub fn extension_for(url: &str, content_type: Option<&str>) -> &'static str {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"\.(mp3|m4a|mp4|aac|ogg|opus|wav|flac)$").unwrap());
@@ -81,9 +92,11 @@ pub fn download(
     let mut resp = client
         .get(url)
         .send()
-        .with_context(|| format!("GET {url}"))?
+        .map_err(crate::http::safe_error)
+        .with_context(|| format!("GET {}", crate::http::display_url(url)))?
         .error_for_status()
-        .with_context(|| format!("GET {url}"))?;
+        .map_err(crate::http::safe_error)
+        .with_context(|| format!("GET {}", crate::http::display_url(url)))?;
     let ct = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -117,7 +130,10 @@ pub fn download(
         let mut file = std::fs::File::create(&part_path)?;
         let mut buf = vec![0u8; 1 << 16];
         loop {
-            let n = resp.read(&mut buf)?;
+            // The nested I/O error may contain a signed redirect URL.
+            let n = resp
+                .read(&mut buf)
+                .map_err(|_| anyhow::anyhow!("HTTP body transfer failed"))?;
             if n == 0 {
                 break;
             }
@@ -169,5 +185,29 @@ mod tests {
         );
         assert_eq!(extension_for("https://x/stream", Some("audio/mpeg")), "mp3");
         assert_eq!(extension_for("https://x/stream", None), "mp3");
+    }
+
+    #[test]
+    fn filenames_distinguish_colliding_titles_and_feed_slugs() {
+        let mut ep = crate::db::Episode {
+            guid: "one".into(),
+            feed_name: "a/b".into(),
+            title: "A / B".into(),
+            published: None,
+            audio_url: String::new(),
+            description: String::new(),
+            audio_path: None,
+            transcript_path: None,
+            status: crate::db::Status::New,
+            error: None,
+        };
+        let first = episode_filename(&ep);
+        assert_eq!(first, episode_filename(&ep));
+        ep.guid = "two".into();
+        ep.title = "A: B".into();
+        assert_ne!(first, episode_filename(&ep));
+        ep.guid = "one".into();
+        ep.feed_name = "a:b".into();
+        assert_ne!(first, episode_filename(&ep));
     }
 }

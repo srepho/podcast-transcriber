@@ -28,23 +28,24 @@ pub struct ParsedFeed {
     pub next_page: Option<String>,
 }
 
-pub fn http_client() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?)
-}
-
 /// Fetch the first page of a feed.
 pub fn fetch(client: &reqwest::blocking::Client, url: &str) -> Result<ParsedFeed> {
     let bytes = client
         .get(url)
         .send()
-        .with_context(|| format!("fetching feed {url}"))?
+        .map_err(crate::http::safe_error)
+        .with_context(|| format!("fetching feed {}", crate::http::display_url(url)))?
         .error_for_status()
-        .with_context(|| format!("fetching feed {url}"))?
-        .bytes()?;
-    parse(&bytes).with_context(|| format!("parsing feed {url}"))
+        .map_err(crate::http::safe_error)
+        .with_context(|| format!("fetching feed {}", crate::http::display_url(url)))?
+        .bytes()
+        .map_err(crate::http::safe_error)?;
+    parse(&bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "invalid feed document from {}",
+            crate::http::display_url(url)
+        )
+    })
 }
 
 /// Fetch every page of a feed by following `rel="next"` links. Most podcast feeds have a single
@@ -90,11 +91,11 @@ pub fn fetch_all(
 }
 
 pub fn parse(bytes: &[u8]) -> Result<ParsedFeed> {
-    let raw: RawFeed = feed_rs::parser::parse(bytes)?;
-    // feed-rs invents a *random* UUID for items with no <guid>, which would make such episodes
-    // look new on every refresh. If the document has no guids at all, key episodes by their
-    // audio URL (minus query string) instead.
-    let has_guids = raw.feed_type != feed_rs::model::FeedType::RSS2 || contains(bytes, b"<guid");
+    // Leave missing IDs empty so the fallback is chosen per entry, including mixed feeds.
+    let raw: RawFeed = feed_rs::parser::Builder::new()
+        .id_generator(|_, _, _| String::new())
+        .build()
+        .parse(bytes)?;
     let title = raw
         .title
         .as_ref()
@@ -106,11 +107,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedFeed> {
         .iter()
         .find(|l| l.rel.as_deref() == Some("next"))
         .map(|l| l.href.clone());
-    let mut episodes: Vec<FeedEpisode> = raw
-        .entries
-        .iter()
-        .filter_map(|e| entry_to_episode(e, has_guids))
-        .collect();
+    let mut episodes: Vec<FeedEpisode> = raw.entries.iter().filter_map(entry_to_episode).collect();
     episodes.sort_by_key(|e| std::cmp::Reverse(e.published));
     Ok(ParsedFeed {
         title,
@@ -119,9 +116,9 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedFeed> {
     })
 }
 
-fn entry_to_episode(entry: &Entry, has_guids: bool) -> Option<FeedEpisode> {
+fn entry_to_episode(entry: &Entry) -> Option<FeedEpisode> {
     let audio_url = find_audio_url(entry)?;
-    let guid = if has_guids && !entry.id.trim().is_empty() {
+    let guid = if !entry.id.trim().is_empty() {
         entry.id.clone()
     } else {
         audio_url
@@ -173,10 +170,6 @@ fn find_audio_url(entry: &Entry) -> Option<String> {
         }
     }
     None
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 pub fn looks_like_audio(url: &str, mime: Option<&str>) -> bool {
@@ -263,5 +256,32 @@ mod tests {
         assert!(looks_like_audio("https://x/a.MP3?token=1", None));
         assert!(!looks_like_audio("https://x/a.html", Some("text/html")));
         assert!(!looks_like_audio("https://x/a", None));
+    }
+
+    #[test]
+    fn mixed_guid_feed_is_stable_across_refreshes() {
+        let first = parse(RSS.as_bytes()).unwrap();
+        let second = parse(RSS.as_bytes()).unwrap();
+        assert_eq!(first.episodes, second.episodes);
+        assert_eq!(first.episodes[2].guid, "https://cdn.example.com/4.m4a");
+        let db = crate::db::Db::open_memory().unwrap();
+        let feed = crate::config::Feed {
+            name: "test".into(),
+            url: "https://example.com/feed".into(),
+            enabled: true,
+            prompt: None,
+        };
+        assert_eq!(
+            crate::pipeline::ingest(&db, &feed, &first, 3)
+                .unwrap()
+                .queued,
+            3
+        );
+        assert_eq!(
+            crate::pipeline::ingest(&db, &feed, &second, 3)
+                .unwrap()
+                .queued,
+            0
+        );
     }
 }

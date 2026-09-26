@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -102,23 +103,62 @@ impl Transcript {
     /// Write the requested formats into `dir/<basename>.<fmt>`. Returns the primary (.txt if
     /// requested, else first) path.
     pub fn write(&self, dir: &Path, basename: &str, formats: &[String]) -> Result<PathBuf> {
+        validate_segments(&self.segments)?;
+        anyhow::ensure!(!formats.is_empty(), "no transcript formats configured");
+        // Validate and render everything before touching existing outputs.
+        let rendered = formats
+            .iter()
+            .map(|f| {
+                let body = match f.as_str() {
+                    "txt" => self.plain_text(),
+                    "srt" => self.srt(),
+                    "json" => serde_json::to_string_pretty(self)? + "\n",
+                    other => {
+                        anyhow::bail!("unknown transcript format '{other}' (use txt, srt, json)")
+                    }
+                };
+                Ok((f, body))
+            })
+            .collect::<Result<Vec<_>>>()?;
         std::fs::create_dir_all(dir)?;
         let mut primary = None;
-        for f in formats {
+        let mut staged = Vec::new();
+        for (f, body) in rendered {
             let path = dir.join(format!("{basename}.{f}"));
-            let body = match f.as_str() {
-                "txt" => self.plain_text(),
-                "srt" => self.srt(),
-                "json" => serde_json::to_string_pretty(self)? + "\n",
-                other => anyhow::bail!("unknown transcript format '{other}' (use txt, srt, json)"),
-            };
-            std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+            let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+            temp.write_all(body.as_bytes())
+                .with_context(|| format!("staging {}", path.display()))?;
+            temp.as_file().sync_all()?;
             if f == "txt" || primary.is_none() {
-                primary = Some(path);
+                primary = Some(path.clone());
             }
+            staged.push((temp, path));
+        }
+        // Each rename is atomic. Multiple formats are not a filesystem transaction.
+        for (temp, path) in staged {
+            temp.persist(&path)
+                .with_context(|| format!("publishing {}", path.display()))?;
         }
         primary.context("no transcript formats configured")
     }
+}
+
+fn validate_segments(segments: &[Segment]) -> Result<()> {
+    anyhow::ensure!(
+        segments.iter().any(|s| !s.text.trim().is_empty()),
+        "transcription produced no text; audio retained for retry"
+    );
+    Ok(())
+}
+
+fn set_language<'a>(
+    params: &mut FullParams<'a, '_>,
+    language: Option<&'a str>,
+    multilingual: bool,
+) {
+    // detect_language=true means detect ONLY in whisper.cpp, returning before decoding.
+    params.set_detect_language(false);
+    params.set_language(if multilingual { language } else { Some("en") });
 }
 
 pub fn srt_time(secs: f64) -> String {
@@ -184,11 +224,7 @@ impl Engine {
         params.set_suppress_nst(true);
         params.set_progress_callback_safe(on_progress);
         let lang = self.settings.language.clone();
-        match (&lang, self.ctx.is_multilingual()) {
-            (Some(l), true) => params.set_language(Some(l.as_str())),
-            (None, true) => params.set_detect_language(true),
-            (_, false) => params.set_language(Some("en")),
-        }
+        set_language(&mut params, lang.as_deref(), self.ctx.is_multilingual());
         let prompt_owned = prompt
             .map(str::to_string)
             .or_else(|| self.settings.initial_prompt.clone());
@@ -211,6 +247,7 @@ impl Engine {
                 raw_text: None,
             });
         }
+        validate_segments(&segments)?;
         let detected = if self.ctx.is_multilingual() {
             let id = state.full_lang_id_from_state();
             whisper_rs::get_lang_str(id).map(|s| s.to_string())
@@ -303,5 +340,39 @@ mod tests {
         let v2 = crate::vocab::Vocab::parse("yokic => Nikola Jokić\n");
         t.apply_vocab(&v2, 0.8);
         assert_eq!(t.segments[0].text, " Hello Nikola Jokić.");
+    }
+
+    #[test]
+    fn invalid_or_empty_output_does_not_replace_existing_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ep.txt");
+        std::fs::write(&target, "original").unwrap();
+        let mut t = tr();
+        assert!(t
+            .write(dir.path(), "ep", &["txt".into(), "bad".into()])
+            .is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        t.segments.clear();
+        assert!(t.write(dir.path(), "ep", &["txt".into()]).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        t.segments.push(Segment {
+            start: 0.0,
+            end: 1.0,
+            text: "  \n ".into(),
+            raw_text: None,
+        });
+        assert!(t.write(dir.path(), "ep", &["txt".into()]).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn auto_language_does_not_select_whispers_detection_only_mode() {
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        set_language(&mut params, None, true);
+        // whisper-rs exposes its native parameter values through Debug, but no getters.
+        // Check the actual C parameters without loading a multilingual model.
+        let native = format!("{params:?}");
+        assert!(native.contains("detect_language: false"));
+        assert!(native.contains("language: 0x0,"));
     }
 }

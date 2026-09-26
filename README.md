@@ -24,8 +24,14 @@ podcast add https://example.com/feed.rss --name myshow
 podcast run                          # refresh feeds, download queued, transcribe downloaded
 ```
 
-Transcripts land in `data/transcripts/<feed>/<date>_<title>.{txt,srt,json}`.
+Transcripts land in `data/transcripts/<feed>/<date>_<title>_<id>.{txt,srt,json}`.
+The ID suffix is a stable hash of the subscription name and episode GUID, so episodes
+with the same date/title have separate files. Existing files remain at their recorded paths.
 Audio is kept in `data/audio/<feed>/` unless `delete_audio_after_transcribe: true`.
+
+Existing databases are upgraded transactionally on first use to identify episodes by
+subscription and GUID together. Records, statuses and paths are preserved; keep a backup
+before using an older binary with an upgraded database.
 
 ## Historical episodes
 
@@ -95,6 +101,15 @@ for keys named like `name` or `player`) to feed `vocab import` with historical p
 Every command takes `--config <path>` (default `./config.yaml`) and `--limit N` where
 it makes sense, so `podcast run --limit 2` is a safe cron/launchd job.
 
+Pipeline commands exit nonzero when any attempted item fails, while retaining successful
+work. `run` attempts all three stages even if an earlier one reports failures. Inspect
+`status` and use `retry` after resolving the cause. Empty transcription output is a failure:
+the audio is retained. Transcript files are staged before publication and replaced atomically
+per file; replacing several formats is not one transaction.
+
+Feed listings and HTTP diagnostics hide URL paths, queries and credentials. Configuration,
+the state database and JSON transcript metadata still contain private URLs; keep these private.
+
 ## Config reference
 
 ```yaml
@@ -103,6 +118,8 @@ max_new_per_feed: 3            # queued when a feed is first added; older = skip
 delete_audio_after_transcribe: false
 formats: [txt, srt, json]      # keep json if you want `correct` to work later
 max_feed_pages: 50             # pagination cap for backfill
+feed_timeout_secs: 60          # total deadline for each feed request
+download_timeout_secs: 3600    # total deadline for each audio/model download
 correction_threshold: 0.8
 whisper:
   model: base.en               # tiny.en base.en small.en medium.en large-v3-turbo large-v3

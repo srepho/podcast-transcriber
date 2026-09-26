@@ -35,7 +35,7 @@ pub fn resolve_model(settings: &crate::config::Settings) -> Result<PathBuf> {
         );
     }
     ensure_model(
-        &crate::feeds::http_client()?,
+        &crate::http::client(settings.download_timeout_secs)?,
         &settings.whisper.model,
         &settings.model_dir(),
     )

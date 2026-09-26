@@ -78,7 +78,7 @@ pub struct Episode {
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS episodes (
-    guid            TEXT PRIMARY KEY,
+    guid            TEXT NOT NULL,
     feed_name       TEXT NOT NULL,
     title           TEXT NOT NULL,
     published       TEXT,
@@ -89,7 +89,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     status          TEXT NOT NULL,
     error           TEXT,
     added_at        TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (feed_name, guid)
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
 CREATE INDEX IF NOT EXISTS idx_episodes_feed ON episodes(feed_name);
@@ -104,10 +105,37 @@ impl Db {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        conn.execute_batch(SCHEMA)?;
+        Self::initialize(&mut conn)?;
         Ok(Self { conn })
+    }
+
+    /// Upgrade the original GUID-only key transactionally, preserving every column/path.
+    fn initialize(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction()?;
+        let legacy = {
+            let mut stmt = tx.prepare("PRAGMA table_info(episodes)")?;
+            let columns = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            columns.iter().any(|(name, pk)| name == "guid" && *pk == 1)
+                && columns
+                    .iter()
+                    .any(|(name, pk)| name == "feed_name" && *pk == 0)
+        };
+        if legacy {
+            tx.execute_batch("ALTER TABLE episodes RENAME TO episodes_legacy;")?;
+            tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(
+                "INSERT INTO episodes SELECT * FROM episodes_legacy;
+                              DROP TABLE episodes_legacy;",
+            )?;
+        }
+        // Recreate indexes after dropping the legacy table (which owned their names).
+        tx.execute_batch(SCHEMA)?;
+        tx.commit()?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -146,34 +174,56 @@ impl Db {
         Ok(n == 1)
     }
 
-    pub fn set_status(&self, guid: &str, status: Status, error: Option<&str>) -> Result<()> {
+    pub fn set_status(
+        &self,
+        feed_name: &str,
+        guid: &str,
+        status: Status,
+        error: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE episodes SET status=?1, error=?2, updated_at=?3 WHERE guid=?4",
-            params![status.as_str(), error, Utc::now().to_rfc3339(), guid],
+            "UPDATE episodes SET status=?1, error=?2, updated_at=?3 WHERE guid=?4 AND feed_name=?5",
+            params![
+                status.as_str(),
+                error,
+                Utc::now().to_rfc3339(),
+                guid,
+                feed_name
+            ],
         )?;
         Ok(())
     }
 
-    pub fn set_audio_path(&self, guid: &str, path: &Path) -> Result<()> {
+    pub fn set_audio_path(&self, feed_name: &str, guid: &str, path: &Path) -> Result<()> {
         self.conn.execute(
-            "UPDATE episodes SET audio_path=?1, updated_at=?2 WHERE guid=?3",
-            params![path.to_string_lossy(), Utc::now().to_rfc3339(), guid],
+            "UPDATE episodes SET audio_path=?1, updated_at=?2 WHERE guid=?3 AND feed_name=?4",
+            params![
+                path.to_string_lossy(),
+                Utc::now().to_rfc3339(),
+                guid,
+                feed_name
+            ],
         )?;
         Ok(())
     }
 
-    pub fn set_transcript_path(&self, guid: &str, path: &Path) -> Result<()> {
+    pub fn set_transcript_path(&self, feed_name: &str, guid: &str, path: &Path) -> Result<()> {
         self.conn.execute(
-            "UPDATE episodes SET transcript_path=?1, updated_at=?2 WHERE guid=?3",
-            params![path.to_string_lossy(), Utc::now().to_rfc3339(), guid],
+            "UPDATE episodes SET transcript_path=?1, updated_at=?2 WHERE guid=?3 AND feed_name=?4",
+            params![
+                path.to_string_lossy(),
+                Utc::now().to_rfc3339(),
+                guid,
+                feed_name
+            ],
         )?;
         Ok(())
     }
 
-    pub fn clear_audio_path(&self, guid: &str) -> Result<()> {
+    pub fn clear_audio_path(&self, feed_name: &str, guid: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE episodes SET audio_path=NULL, updated_at=?1 WHERE guid=?2",
-            params![Utc::now().to_rfc3339(), guid],
+            "UPDATE episodes SET audio_path=NULL, updated_at=?1 WHERE guid=?2 AND feed_name=?3",
+            params![Utc::now().to_rfc3339(), guid, feed_name],
         )?;
         Ok(())
     }
@@ -186,12 +236,12 @@ impl Db {
     }
 
     #[cfg(test)]
-    pub fn get(&self, guid: &str) -> Result<Option<Episode>> {
+    pub fn get(&self, feed_name: &str, guid: &str) -> Result<Option<Episode>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT * FROM episodes WHERE guid=?1",
-                params![guid],
+                "SELECT * FROM episodes WHERE guid=?1 AND feed_name=?2",
+                params![guid, feed_name],
                 row_to_episode,
             )
             .optional()?)
@@ -293,22 +343,27 @@ mod tests {
         let db = Db::open_memory().unwrap();
         assert!(db.insert(&ep("a", Status::New)).unwrap());
         assert!(!db.insert(&ep("a", Status::Skipped)).unwrap());
-        assert_eq!(db.get("a").unwrap().unwrap().status, Status::New);
+        assert_eq!(db.get("f", "a").unwrap().unwrap().status, Status::New);
     }
 
     #[test]
     fn status_transitions_and_paths() {
         let db = Db::open_memory().unwrap();
         db.insert(&ep("a", Status::New)).unwrap();
-        db.set_audio_path("a", Path::new("/tmp/a.mp3")).unwrap();
-        db.set_status("a", Status::Downloaded, None).unwrap();
-        let got = db.get("a").unwrap().unwrap();
+        db.set_audio_path("f", "a", Path::new("/tmp/a.mp3"))
+            .unwrap();
+        db.set_status("f", "a", Status::Downloaded, None).unwrap();
+        let got = db.get("f", "a").unwrap().unwrap();
         assert_eq!(got.status, Status::Downloaded);
         assert_eq!(got.audio_path, Some(PathBuf::from("/tmp/a.mp3")));
-        db.set_status("a", Status::Failed, Some("boom")).unwrap();
-        assert_eq!(db.get("a").unwrap().unwrap().error.as_deref(), Some("boom"));
-        db.clear_audio_path("a").unwrap();
-        assert!(db.get("a").unwrap().unwrap().audio_path.is_none());
+        db.set_status("f", "a", Status::Failed, Some("boom"))
+            .unwrap();
+        assert_eq!(
+            db.get("f", "a").unwrap().unwrap().error.as_deref(),
+            Some("boom")
+        );
+        db.clear_audio_path("f", "a").unwrap();
+        assert!(db.get("f", "a").unwrap().unwrap().audio_path.is_none());
     }
 
     #[test]
@@ -327,5 +382,69 @@ mod tests {
         assert!(counts.contains(&(Status::Skipped, 1)));
         assert_eq!(db.delete_feed("f").unwrap(), 2);
         assert_eq!(db.feed_count("f").unwrap(), 0);
+    }
+
+    #[test]
+    fn same_guid_in_different_feeds_has_independent_state() {
+        let db = Db::open_memory().unwrap();
+        let first = ep("shared", Status::New);
+        let mut second = first.clone();
+        second.feed_name = "other".into();
+        assert!(db.insert(&first).unwrap());
+        assert!(db.insert(&second).unwrap());
+        db.set_audio_path("f", "shared", Path::new("audio.mp3"))
+            .unwrap();
+        db.set_transcript_path("f", "shared", Path::new("transcript.txt"))
+            .unwrap();
+        db.set_status("f", "shared", Status::Transcribed, None)
+            .unwrap();
+        assert_eq!(db.get("other", "shared").unwrap().unwrap(), second);
+        db.clear_audio_path("f", "shared").unwrap();
+        assert!(db.get("f", "shared").unwrap().unwrap().audio_path.is_none());
+        db.delete_feed("f").unwrap();
+        assert_eq!(db.get("other", "shared").unwrap().unwrap(), second);
+    }
+
+    #[test]
+    fn legacy_database_migration_preserves_records_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let conn = Connection::open(&path).unwrap();
+        let legacy = SCHEMA
+            .replace(
+                "guid            TEXT NOT NULL",
+                "guid            TEXT PRIMARY KEY",
+            )
+            .replace(",\n    PRIMARY KEY (feed_name, guid)", "");
+        conn.execute_batch(&legacy).unwrap();
+        let old = Db { conn };
+        let mut original = ep("shared", Status::Transcribed);
+        original.audio_path = Some(PathBuf::from("original/audio.mp3"));
+        original.transcript_path = Some(PathBuf::from("original/transcript.txt"));
+        original.description = "Retained show notes".into();
+        old.insert(&original).unwrap();
+        old.conn
+            .execute(
+                "UPDATE episodes SET added_at='old-added', updated_at='old-updated'",
+                [],
+            )
+            .unwrap();
+        drop(old);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get("f", "shared").unwrap().unwrap(), original);
+        let timestamps: (String, String) = db
+            .conn
+            .query_row("SELECT added_at, updated_at FROM episodes", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(timestamps, ("old-added".into(), "old-updated".into()));
+        let mut other = original.clone();
+        other.feed_name = "other".into();
+        assert!(db.insert(&other).unwrap());
+        drop(db);
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(reopened.list(None, None).unwrap().len(), 2);
+        assert_eq!(reopened.get("f", "shared").unwrap().unwrap(), original);
     }
 }

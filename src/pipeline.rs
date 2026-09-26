@@ -50,6 +50,19 @@ pub fn correct_existing(settings: &Settings, db: &Db, feed_name: &str) -> Result
     Ok((done, changed))
 }
 
+/// Preserve successful work while reporting item failures to callers/schedulers.
+pub struct Batch<T> {
+    pub value: T,
+    pub failed: usize,
+}
+
+impl<T> Batch<T> {
+    pub fn check(&self, stage: &str) -> Result<()> {
+        anyhow::ensure!(self.failed == 0, "{stage}: {} item(s) failed", self.failed);
+        Ok(())
+    }
+}
+
 pub struct RefreshReport {
     pub feed: String,
     pub queued: usize,
@@ -101,9 +114,14 @@ pub fn ingest(db: &Db, feed: &Feed, parsed: &ParsedFeed, max_new: usize) -> Resu
     })
 }
 
-pub fn refresh(settings: &Settings, db: &Db, only: Option<&str>) -> Result<Vec<RefreshReport>> {
-    let client = feeds::http_client()?;
+pub fn refresh(
+    settings: &Settings,
+    db: &Db,
+    only: Option<&str>,
+) -> Result<Batch<Vec<RefreshReport>>> {
+    let client = crate::http::client(settings.feed_timeout_secs)?;
     let mut reports = vec![];
+    let mut failed = 0;
     for feed in settings.feeds.iter().filter(|f| f.enabled) {
         if let Some(name) = only {
             if feed.name != name {
@@ -112,10 +130,16 @@ pub fn refresh(settings: &Settings, db: &Db, only: Option<&str>) -> Result<Vec<R
         }
         match feeds::fetch(&client, &feed.url) {
             Ok(parsed) => reports.push(ingest(db, feed, &parsed, settings.max_new_per_feed)?),
-            Err(e) => eprintln!("warning: feed '{}' failed: {e:#}", feed.name),
+            Err(e) => {
+                failed += 1;
+                eprintln!("warning: feed '{}' failed: {e:#}", feed.name);
+            }
         }
     }
-    Ok(reports)
+    Ok(Batch {
+        value: reports,
+        failed,
+    })
 }
 
 /// Which historical episodes to queue.
@@ -181,7 +205,7 @@ pub fn backfill(
     filter: &BackfillFilter,
     dry_run: bool,
 ) -> Result<Vec<Episode>> {
-    let client = feeds::http_client()?;
+    let client = crate::http::client(settings.feed_timeout_secs)?;
     let parsed = feeds::fetch_all(&client, &feed.url, settings.max_feed_pages, |page, n| {
         if page > 1 {
             eprintln!("  page {page}: {n} more episodes");
@@ -199,7 +223,7 @@ pub fn backfill(
     let selected = select_backfill(db, &feed.name, filter)?;
     if !dry_run {
         for e in &selected {
-            db.set_status(&e.guid, Status::New, None)?;
+            db.set_status(&e.feed_name, &e.guid, Status::New, None)?;
         }
     }
     Ok(selected)
@@ -210,13 +234,14 @@ pub fn download_pending(
     db: &Db,
     only: Option<&str>,
     limit: Option<usize>,
-) -> Result<usize> {
-    let client = feeds::http_client()?;
+) -> Result<Batch<usize>> {
+    let client = crate::http::client(settings.download_timeout_secs)?;
     let mut eps = db.list(Some(Status::New), only)?;
     if let Some(n) = limit {
         eps.truncate(n);
     }
     let mut ok = 0;
+    let mut failed = 0;
     for (i, ep) in eps.iter().enumerate() {
         eprintln!(
             "[{}/{}] downloading {} / {}",
@@ -226,20 +251,26 @@ pub fn download_pending(
             ep.title
         );
         let dir = settings.audio_dir().join(download::slug(&ep.feed_name, 60));
-        let basename = download::episode_basename(&ep.title, ep.published);
+        let basename = download::episode_filename(ep);
         match download::download(&client, &ep.audio_url, &dir, &basename, true) {
             Ok(path) => {
-                db.set_audio_path(&ep.guid, &path)?;
-                db.set_status(&ep.guid, Status::Downloaded, None)?;
+                db.set_audio_path(&ep.feed_name, &ep.guid, &path)?;
+                db.set_status(&ep.feed_name, &ep.guid, Status::Downloaded, None)?;
                 ok += 1;
             }
             Err(e) => {
+                failed += 1;
                 eprintln!("  failed: {e:#}");
-                db.set_status(&ep.guid, Status::Failed, Some(&format!("download: {e:#}")))?;
+                db.set_status(
+                    &ep.feed_name,
+                    &ep.guid,
+                    Status::Failed,
+                    Some(&format!("download: {e:#}")),
+                )?;
             }
         }
     }
-    Ok(ok)
+    Ok(Batch { value: ok, failed })
 }
 
 pub fn transcribe_pending(
@@ -247,13 +278,16 @@ pub fn transcribe_pending(
     db: &Db,
     only: Option<&str>,
     limit: Option<usize>,
-) -> Result<usize> {
+) -> Result<Batch<usize>> {
     let mut eps = db.list(Some(Status::Downloaded), only)?;
     if let Some(n) = limit {
         eps.truncate(n);
     }
     if eps.is_empty() {
-        return Ok(0);
+        return Ok(Batch {
+            value: 0,
+            failed: 0,
+        });
     }
     if !crate::audio::ffmpeg_available() {
         anyhow::bail!("ffmpeg not found on PATH (brew install ffmpeg)");
@@ -268,6 +302,7 @@ pub fn transcribe_pending(
     let mut vocabs: std::collections::HashMap<String, Vocab> = Default::default();
 
     let mut ok = 0;
+    let mut failed = 0;
     for (i, ep) in eps.iter().enumerate() {
         eprintln!(
             "[{}/{}] transcribing {} / {}",
@@ -276,22 +311,27 @@ pub fn transcribe_pending(
             ep.feed_name,
             ep.title
         );
-        let vocab = match vocabs.get(&ep.feed_name) {
-            Some(v) => v.clone(),
-            None => {
-                let v = Vocab::load(&settings.vocab_path(&ep.feed_name))?;
-                vocabs.insert(ep.feed_name.clone(), v.clone());
-                v
-            }
-        };
-        match transcribe_one(settings, db, &engine, ep, &vocab) {
+        let result = (|| {
+            let vocab = match vocabs.get(&ep.feed_name) {
+                Some(v) => v.clone(),
+                None => {
+                    let v = Vocab::load(&settings.vocab_path(&ep.feed_name))?;
+                    vocabs.insert(ep.feed_name.clone(), v.clone());
+                    v
+                }
+            };
+            transcribe_one(settings, db, &engine, ep, &vocab)
+        })();
+        match result {
             Ok(path) => {
                 eprintln!("  -> {}", path.display());
                 ok += 1;
             }
             Err(e) => {
+                failed += 1;
                 eprintln!("  failed: {e:#}");
                 db.set_status(
+                    &ep.feed_name,
                     &ep.guid,
                     Status::Failed,
                     Some(&format!("transcribe: {e:#}")),
@@ -299,7 +339,7 @@ pub fn transcribe_pending(
             }
         }
     }
-    Ok(ok)
+    Ok(Batch { value: ok, failed })
 }
 
 fn transcribe_one(
@@ -373,13 +413,13 @@ fn transcribe_one(
     let dir = settings
         .transcript_dir()
         .join(download::slug(&ep.feed_name, 60));
-    let basename = download::episode_basename(&ep.title, ep.published);
+    let basename = download::episode_filename(ep);
     let path = transcript.write(&dir, &basename, &settings.formats)?;
-    db.set_transcript_path(&ep.guid, &path)?;
-    db.set_status(&ep.guid, Status::Transcribed, None)?;
+    db.set_transcript_path(&ep.feed_name, &ep.guid, &path)?;
+    db.set_status(&ep.feed_name, &ep.guid, Status::Transcribed, None)?;
     if settings.delete_audio_after_transcribe {
         let _ = std::fs::remove_file(audio_path);
-        db.clear_audio_path(&ep.guid)?;
+        db.clear_audio_path(&ep.feed_name, &ep.guid)?;
     }
     Ok(path)
 }
@@ -388,6 +428,64 @@ fn transcribe_one(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn refresh_continues_after_failure_and_reports_partial_success() {
+        use crate::test_support::{response, serve};
+        let rss = r#"<rss version="2.0"><channel><title>Test</title><item><guid>one</guid><title>One</title><enclosure url="https://example.com/audio.mp3" type="audio/mpeg"/></item></channel></rss>"#;
+        let (url, server) = serve(vec![(
+            response(200, "application/rss+xml", rss),
+            std::time::Duration::ZERO,
+        )]);
+        let mut broken = feed();
+        broken.url = "invalid://secret/feed".into();
+        let mut healthy = feed();
+        healthy.name = "healthy".into();
+        healthy.url = url;
+        let settings = Settings {
+            feeds: vec![broken, healthy],
+            ..Settings::default()
+        };
+        let db = Db::open_memory().unwrap();
+        let report = refresh(&settings, &db, None).unwrap();
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.value.len(), 1);
+        assert_eq!(report.value[0].queued, 1);
+        assert!(report.check("refresh").is_err());
+        assert_eq!(db.feed_count("healthy").unwrap(), 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn download_continues_after_failure_and_records_safe_error() {
+        use crate::test_support::{response, serve};
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            data_dir: dir.path().into(),
+            ..Settings::default()
+        };
+        let db = Db::open_memory().unwrap();
+        let (url, server) = serve(vec![(
+            response(200, "audio/mpeg", "second audio"),
+            std::time::Duration::ZERO,
+        )]);
+        let mut episodes = parsed(2);
+        episodes.episodes[0].audio_url = url;
+        episodes.episodes[1].audio_url = "invalid://secret/audio?token=secret".into();
+        ingest(&db, &feed(), &episodes, 2).unwrap();
+        let report = download_pending(&settings, &db, None, None).unwrap();
+        assert_eq!((report.value, report.failed), (1, 1));
+        assert!(report.check("download").is_err());
+        let failed = db.list(Some(Status::Failed), None).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(!failed[0].error.as_ref().unwrap().contains("secret"));
+        let downloaded = db.list(Some(Status::Downloaded), None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(downloaded[0].audio_path.as_ref().unwrap()).unwrap(),
+            "second audio"
+        );
+        server.join().unwrap();
+    }
 
     fn feed() -> Feed {
         Feed {

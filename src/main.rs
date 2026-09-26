@@ -3,8 +3,11 @@ mod config;
 mod db;
 mod download;
 mod feeds;
+mod http;
 mod models;
 mod pipeline;
+#[cfg(test)]
+mod test_support;
 mod transcribe;
 mod vocab;
 
@@ -179,7 +182,7 @@ fn run() -> Result<()> {
         }
 
         Cmd::Add { url, name } => {
-            let client = feeds::http_client()?;
+            let client = http::client(settings.feed_timeout_secs)?;
             let parsed = feeds::fetch(&client, &url)?;
             let name = name.unwrap_or_else(|| download::slug(&parsed.title, 40).to_lowercase());
             if settings.feed(&name).is_some() {
@@ -231,7 +234,7 @@ fn run() -> Result<()> {
                     "{:<24} {}{}  [{}]",
                     f.name,
                     if f.enabled { "" } else { "(disabled) " },
-                    f.url,
+                    http::display_url(&f.url),
                     summary.join(", ")
                 );
             }
@@ -240,7 +243,8 @@ fn run() -> Result<()> {
         Cmd::Refresh { feed } => {
             require_feed(&settings, feed.as_deref())?;
             let db = Db::open(&settings.db_path())?;
-            for r in pipeline::refresh(&settings, &db, feed.as_deref())? {
+            let batch = pipeline::refresh(&settings, &db, feed.as_deref())?;
+            for r in &batch.value {
                 println!(
                     "{:<24} {} new{}",
                     r.feed,
@@ -252,6 +256,7 @@ fn run() -> Result<()> {
                     }
                 );
             }
+            batch.check("refresh")?;
         }
 
         Cmd::Backfill {
@@ -299,26 +304,51 @@ fn run() -> Result<()> {
             require_feed(&settings, feed.as_deref())?;
             let db = Db::open(&settings.db_path())?;
             let n = pipeline::download_pending(&settings, &db, feed.as_deref(), limit)?;
-            println!("downloaded {n}");
+            println!("downloaded {}, failed {}", n.value, n.failed);
+            n.check("download")?;
         }
 
         Cmd::Transcribe { feed, limit } => {
             require_feed(&settings, feed.as_deref())?;
             let db = Db::open(&settings.db_path())?;
             let n = pipeline::transcribe_pending(&settings, &db, feed.as_deref(), limit)?;
-            println!("transcribed {n}");
+            println!("transcribed {}, failed {}", n.value, n.failed);
+            n.check("transcribe")?;
         }
 
         Cmd::Run { feed, limit } => {
             require_feed(&settings, feed.as_deref())?;
             let db = Db::open(&settings.db_path())?;
-            let reports = pipeline::refresh(&settings, &db, feed.as_deref())?;
-            let new: usize = reports.iter().map(|r| r.queued).sum();
-            eprintln!("refresh: {new} new episode(s)");
-            let d = pipeline::download_pending(&settings, &db, feed.as_deref(), limit)?;
-            eprintln!("download: {d}");
-            let t = pipeline::transcribe_pending(&settings, &db, feed.as_deref(), limit)?;
-            println!("run complete: {new} new, {d} downloaded, {t} transcribed");
+            // Evaluate every stage even when an earlier stage has failed items.
+            let refresh = pipeline::refresh(&settings, &db, feed.as_deref()).and_then(|batch| {
+                let new: usize = batch.value.iter().map(|r| r.queued).sum();
+                eprintln!("refresh: {new} new, {} failed", batch.failed);
+                batch.check("refresh")
+            });
+            let download = pipeline::download_pending(&settings, &db, feed.as_deref(), limit)
+                .and_then(|batch| {
+                    eprintln!(
+                        "download: {} completed, {} failed",
+                        batch.value, batch.failed
+                    );
+                    batch.check("download")
+                });
+            let transcribe = pipeline::transcribe_pending(&settings, &db, feed.as_deref(), limit)
+                .and_then(|batch| {
+                    eprintln!(
+                        "transcribe: {} completed, {} failed",
+                        batch.value, batch.failed
+                    );
+                    batch.check("transcribe")
+                });
+            let failures: Vec<String> = [refresh, download, transcribe]
+                .into_iter()
+                .filter_map(|r| r.err().map(|e| format!("{e:#}")))
+                .collect();
+            if !failures.is_empty() {
+                bail!("run finished with failures: {}", failures.join("; "));
+            }
+            println!("run complete");
         }
 
         Cmd::Status { feed } => {
@@ -361,7 +391,7 @@ fn run() -> Result<()> {
                     Some(p) if p.exists() => Status::Downloaded,
                     _ => Status::New,
                 };
-                db.set_status(&e.guid, back_to, None)?;
+                db.set_status(&e.feed_name, &e.guid, back_to, None)?;
             }
             println!("re-queued {}", failed.len());
         }
@@ -381,7 +411,11 @@ fn run() -> Result<()> {
                 println!("\n* = downloaded to {}", settings.model_dir().display());
             }
             ModelCmd::Download { name } => {
-                let p = models::ensure_model(&feeds::http_client()?, &name, &settings.model_dir())?;
+                let p = models::ensure_model(
+                    &http::client(settings.download_timeout_secs)?,
+                    &name,
+                    &settings.model_dir(),
+                )?;
                 println!("{}", p.display());
             }
         },

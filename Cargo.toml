@@ -20,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 feed-rs = "2"
 indicatif = "0.18"
 regex = "1"
+ring = "0.17"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -29,7 +30,6 @@ strsim = "0.11"
 url = "2"
 whisper-rs = "0.16"
 
-[dev-dependencies]
 tempfile = "3"
 
 [profile.release]
