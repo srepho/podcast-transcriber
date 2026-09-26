@@ -3,7 +3,7 @@
 The initial goal is to assess whether episode evidence can be extracted accurately and
 later add predictive value. This pilot does not infer market probabilities or place orders.
 Core collection remains a Rust CLI; the optional research exporter uses Python 3.10+
-standard-library modules only. No transcripts are sent to an external service.
+standard-library modules only (development tools: `uv sync`). No transcripts are sent to an external service.
 
 ## Collect a bounded sample
 
@@ -22,7 +22,8 @@ requested limit; check the manifest. Collection and export should use the same t
 
 Each bundle is a new directory containing:
 
-- `manifest.json`: schema/extractor versions, sampling frame, counts and file hashes.
+- `manifest.json`: schema/extractor versions, extractor and vocabulary hashes, sampling frame,
+  counts and file hashes.
 - `episodes.jsonl`: hashed episode ID, publication/download/transcription/observation times,
   transcript model and source hash; unknown legacy timestamps remain null.
 - `segments.jsonl`: segment IDs, second offsets, raw ASR wording and corrected wording.
@@ -53,7 +54,7 @@ Acceptance requires:
   performed. Ambiguous mappings stay pending.
 - `temporal_scope`: current, upcoming, historical or unknown. Only current/upcoming
   claims can be selected as signals; a new episode can discuss an old event.
-- An explicit timezone-aware `valid_until` expiry.
+- An explicit timezone-aware `valid_until` expiry, later than the episode's publication.
 - An honest boolean `audio_checked`; acceptance can record transcript-only review, but that
   limitation must remain visible when assessing extraction quality.
 
@@ -67,6 +68,14 @@ python3 scripts/pilot_dataset.py select --dataset data/pilots/reviewed-001 \
 `finalize` verifies bundle hashes and freezes a copy of every disposition, including rejected
 and pending records. `select` writes both `eligible.jsonl` and a full `audit.jsonl` with exclusion
 reasons. Finalized records cannot be silently edited; revised reviews create a new version.
+Every command writes to a staging directory and renames it into place, so an interrupted run
+leaves no partial output.
+
+Before trusting any row, `select` checks that the claims, the frozen review copy and the
+manifest agree (hashes, dispositions, availability times and counts). That catches accidental
+edits, but a manifest can always be rewritten to match. For an experiment, record the
+finalized manifest's SHA-256 in the experiment config and pass it as
+`--expected-manifest-sha256`; the selection manifest records the hash it verified.
 
 ## Time and model contract
 
@@ -77,11 +86,19 @@ known, acceptance, current/upcoming temporal scope, and an unexpired claim. Equa
 and transcription times are never guessed from publication, filesystem times or DB updated_at.
 Re-correction produces a different transcript hash and requires a new bundle/review.
 
-For an explicitly retrospective experiment, `select --historical-delay-hours 24` substitutes
-publication plus the declared processing delay. The manifest is marked `research_only: true`
-and every row has `timing_basis: historical_assumption`. This is not evidence that the data was
-actually available then. Run several predeclared delay scenarios; do not mix assumed and
-observed records in one performance claim.
+For an explicitly retrospective experiment,
+`select --historical-delay-hours 24 --historical-validity-days 7` substitutes publication plus
+the declared processing delay. The manifest is marked `research_only: true` and every row has
+`timing_basis: historical_assumption`. This is not evidence that the data was actually
+available then. Run several predeclared delay scenarios; do not mix assumed and observed
+records in one performance claim.
+
+In historical mode the reviewer's `valid_until` is ignored: it was written after the fact and can
+encode the outcome (for example, an expiry set to the day a player actually returned). Expiry is
+instead the assumed availability plus `--historical-validity-days`, declared before evaluation,
+and rows carry `expiry_basis: historical_policy` and `expires_at`. Hindsight can still leak through
+`temporal_scope`, `certainty` and the choice to accept a claim; review historical episodes without
+looking up what happened next.
 
 The target model can read JSONL with pandas and join explicitly mapped entities to fixtures,
 then use that fixture's saved `decision_time`. This repository does not modify the prediction
@@ -103,7 +120,7 @@ model. Episode mentions must not be treated as independent matches or independen
 cargo test --release --locked
 cargo clippy --release --all-targets -- -D warnings
 cargo fmt --check
-python3 -m unittest discover -s tests -p 'test_*.py'
+uv sync && uv run ruff check && uv run mypy && uv run pytest
 ```
 
 ## Audio checks and expanded evidence
