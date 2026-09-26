@@ -188,6 +188,7 @@ def finalize(bundle, review_path, out):
         raise ValueError("review belongs to another bundle")
     candidates = {c["candidate_id"]: c for c in read_rows(bundle / "candidates.jsonl")}
     episodes = {e["episode_id"]: e for e in read_rows(bundle / "episodes.jsonl")}
+    segments = {s["segment_id"]: s for s in read_rows(bundle / "segments.jsonl")}
     entries = review["reviews"]
     if len(entries) != len(candidates) or {r["candidate_id"] for r in entries} != set(candidates):
         raise ValueError("review must contain every candidate exactly once")
@@ -220,7 +221,20 @@ def finalize(bundle, review_path, out):
         check_time(item.get("valid_until"))
         candidate = candidates[item["candidate_id"]]
         episode = episodes[candidate["episode_id"]]
+        additional = item.get("additional_segment_ids", [])
+        if not isinstance(additional, list) or not all(isinstance(s, str) for s in additional):
+            raise ValueError("additional_segment_ids must be a list of segment IDs")
+        evidence_ids = set(candidate["segment_ids"] + additional)
+        if any(s not in segments or segments[s]["episode_id"] != candidate["episode_id"]
+               or segments[s]["transcript_sha256"] != candidate["transcript_sha256"] for s in evidence_ids):
+            raise ValueError("review evidence must come from the same frozen episode transcript")
+        evidence = sorted((segments[s] for s in evidence_ids), key=lambda s: s["index"])
         rows.append({"schema_version": SCHEMA_VERSION, **candidate,
+                     "reviewed_segment_ids": [s["segment_id"] for s in evidence],
+                     "reviewed_raw_evidence": " ".join(s["raw_text"].strip() for s in evidence),
+                     "reviewed_corrected_evidence": " ".join(s["corrected_text"].strip() for s in evidence),
+                     "reviewed_start_secs": min(s["start_secs"] for s in evidence),
+                     "reviewed_end_secs": max(s["end_secs"] for s in evidence),
                      "published_at": episode["published_at"], "downloaded_at": episode["downloaded_at"],
                      "transcribed_at": episode["transcribed_at"], "transcript_model": episode.get("model"),
                      "bundle_generated_at": manifest["generated_at"], "reviewed_at": finalized if status != "pending" else None,
@@ -236,7 +250,7 @@ def finalize(bundle, review_path, out):
     return rows
 
 
-def select(dataset, decision_time, out, historical_delay_hours=None):
+def select(dataset, decision_time, out, historical_delay_hours=None, require_audio_checked=False):
     cutoff = timestamp(decision_time)
     manifest = json.loads((dataset / "manifest.json").read_text())
     claims = dataset / "claims.jsonl"
@@ -262,6 +276,8 @@ def select(dataset, decision_time, out, historical_delay_hours=None):
                 reason = "not_published_before_cutoff"
             elif row["review"].get("valid_until") and cutoff >= timestamp(row["review"]["valid_until"]):
                 reason = "expired"
+        if reason is None and require_audio_checked and row["review"].get("audio_checked") is not True:
+            reason = "audio_not_verified"
         result = {**row, "decision_time": cutoff.isoformat(), "available_at": availability,
                   "timing_basis": "historical_assumption" if historical_delay_hours is not None else "observed",
                   "eligible": reason is None, "exclusion_reason": reason}
@@ -273,7 +289,8 @@ def select(dataset, decision_time, out, historical_delay_hours=None):
     write_rows(out / "audit.jsonl", audit)
     write_json(out / "manifest.json", {"schema_version": SCHEMA_VERSION, "decision_time": cutoff.isoformat(),
                "source_claims_sha256": manifest["claims_sha256"], "historical_delay_hours": historical_delay_hours,
-               "research_only": historical_delay_hours is not None, "eligible": len(eligible), "total": len(audit)})
+               "research_only": historical_delay_hours is not None, "require_audio_checked": require_audio_checked,
+               "eligible": len(eligible), "total": len(audit)})
     return audit
 
 
@@ -294,6 +311,8 @@ def main():
     select_parser.add_argument("--dataset", type=Path, required=True)
     select_parser.add_argument("--decision-time", required=True)
     select_parser.add_argument("--historical-delay-hours", type=float)
+    select_parser.add_argument("--require-audio-checked", action="store_true",
+                               help="Exclude claims without human audio verification; ASR cross-checks do not qualify")
     select_parser.add_argument("--out", type=Path, required=True)
     args = vars(parser.parse_args())
     command = args.pop("command")

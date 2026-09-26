@@ -105,3 +105,29 @@ cargo clippy --release --all-targets -- -D warnings
 cargo fmt --check
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+## Audio checks and expanded evidence
+
+`select --require-audio-checked` excludes otherwise eligible records unless the reviewer has
+set the boolean `audio_checked` to true after human listening. Local ASR re-transcription,
+including a different decoding strategy using the same model, is a consistency check and
+must leave this flag false. Shared-model passes can repeat the same error.
+
+If a candidate omits its subject or important context, add `additional_segment_ids` to that
+entry in the editable review. Finalization resolves these against the hashed segment file
+and requires the same episode and transcript version. It preserves the original candidate
+and separately exports `reviewed_segment_ids`, reviewed raw/corrected evidence and its time
+span. Do not silently rewrite source wording or infer a missing subject.
+
+For an offseason sample, prioritize contracts, transactions, roster continuity and explicit
+conditional cap scenarios. Scarce injury or rotation reporting is expected, not evidence of
+poor extraction recall. Keep proposed offers distinct from signed contracts, and hypothetical
+roster scenarios distinct from completed transactions. Resolve identity separately from
+current team membership: a podcast can report a change before a saved roster reflects it.
+Hold unresolved roster transitions for corroboration rather than automatically overwriting
+model rosters or declaring the report false.
+
+Expiry is a feature-freshness requirement, not a claim that an injury has healed or a contract
+has ceased to exist. Define it before fixture evaluation; do not extend it merely to obtain
+eligible observations. Longer-lived offseason state features need explicit update/supersession
+rules and a separate validation policy.

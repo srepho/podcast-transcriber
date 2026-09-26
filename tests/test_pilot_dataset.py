@@ -99,6 +99,48 @@ class PilotTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pilot.select(dataset, '2024-03-02T00:00:00Z', self.root / 'invalid', float('nan'))
 
+    def test_audio_verification_gate_excludes_machine_crosschecks(self):
+        dataset = self.reviewed()
+        rows = pilot.select(dataset, '2024-03-04T01:00:00Z', self.root / 'audio_gate', require_audio_checked=True)
+        self.assertEqual(rows[0]['exclusion_reason'], 'audio_not_verified')
+        manifest = json.loads((self.root / 'audio_gate/manifest.json').read_text())
+        self.assertTrue(manifest['require_audio_checked'])
+        review_path = self.bundle / 'review.json'
+        review = json.loads(review_path.read_text())
+        review['reviews'][0]['audio_checked'] = True
+        pilot.write_json(review_path, review)
+        checked = self.root / 'human_verified'
+        with patch.object(pilot, 'now', return_value='2024-03-04T00:00:00Z'):
+            pilot.finalize(self.bundle, review_path, checked)
+        rows = pilot.select(checked, '2024-03-04T01:00:00Z', self.root / 'audio_pass', require_audio_checked=True)
+        self.assertTrue(rows[0]['eligible'])
+
+    def test_additional_evidence_is_resolved_from_frozen_segments(self):
+        source = json.loads(self.source.read_text())
+        source['segments'].append({'start': 15.0, 'end': 20.0, 'text': 'The named subject is Alex Example.'})
+        self.source.write_text(json.dumps(source))
+        self.bundle = self.root / 'expanded_bundle'
+        with patch.object(pilot, 'now', return_value='2024-03-03T00:00:00Z'):
+            pilot.build(self.root, 'demo', 'Daily', 5, self.bundle)
+        review_path = self.bundle / 'review.json'
+        review = json.loads(review_path.read_text())
+        extra = pilot.read_rows(self.bundle / 'segments.jsonl')[-1]['segment_id']
+        review['reviews'][0]['additional_segment_ids'] = [extra]
+        pilot.write_json(review_path, review)
+        rows = pilot.read_rows(self.reviewed() / 'claims.jsonl')
+        self.assertEqual(rows[0]['reviewed_end_secs'], 20.0)
+        self.assertIn('named subject', rows[0]['reviewed_raw_evidence'])
+        self.assertEqual(len(rows[0]['segment_ids']), 2)
+        self.assertEqual(len(rows[0]['reviewed_segment_ids']), 3)
+
+    def test_unknown_additional_evidence_is_rejected(self):
+        review_path = self.bundle / 'review.json'
+        review = json.loads(review_path.read_text())
+        review['reviews'][0]['additional_segment_ids'] = ['invented-segment']
+        pilot.write_json(review_path, review)
+        with self.assertRaises(ValueError):
+            pilot.finalize(self.bundle, review_path, self.root / 'bad')
+
     def test_missing_mapping_blocks_acceptance(self):
         review_path = self.bundle / 'review.json'
         review = json.loads(review_path.read_text())
