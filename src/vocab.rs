@@ -107,6 +107,15 @@ impl Vocab {
         if key.is_empty() || self.terms.iter().any(|t| t.key == key) {
             return;
         }
+        // A bare surname plus suffix ("Washington Jr.") fuzzy-matches the surname alone and
+        // bolts the suffix onto unrelated words ("Washington Wizards", "Jackson Gatlin").
+        let content_words = canonical
+            .split_whitespace()
+            .filter(|w| suffix_class(&normalize_word(w)).is_none())
+            .count();
+        if content_words < 2 && canonical.split_whitespace().count() > 1 {
+            return;
+        }
         self.prepared.push(PreparedTerm {
             key: Prepared::new(key.clone()),
             first: canonical
@@ -307,11 +316,24 @@ impl Vocab {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| self.terms[b.3].key.len().cmp(&self.terms[a.3].key.len()))
         });
-        for (_, i, width, ti) in cands {
+        for (_, i, mut width, ti) in cands {
             if consumed[i..i + width].iter().any(|&c| c) {
                 continue;
             }
             let term = &self.terms[ti];
+            // The suffix the speaker said ("Michael Brown junior") belongs to the name, or
+            // the canonical "Jr." lands in front of it and doubles up.
+            let suffix = suffix_class(&self.prepared[ti].last);
+            let next = i + width;
+            if suffix.is_some()
+                && next < norm.len()
+                && !consumed[next]
+                && !boundary_after[next - 1]
+                && suffix_class(&norm[next - 1]) != suffix
+                && suffix_class(&norm[next]) == suffix
+            {
+                width += 1;
+            }
             let from = join_words(&tokens, &word_idx[i..i + width]);
             let to = without_doubled_period(&tokens, word_idx[i + width - 1], &term.canonical);
             if from != to {
@@ -533,6 +555,18 @@ struct Token {
     is_word: bool,
     /// Index of the transcript segment the token came from.
     seg: usize,
+}
+
+/// Generational suffixes, spoken or written, by the canonical form they stand for.
+fn suffix_class(w: &str) -> Option<&'static str> {
+    match w {
+        "jr" | "junior" => Some("jr"),
+        "sr" | "senior" => Some("sr"),
+        "ii" => Some("ii"),
+        "iii" => Some("iii"),
+        "iv" => Some("iv"),
+        _ => None,
+    }
 }
 
 /// The tokenizer splits a trailing period off a word, so "Jr." arrives as "Jr" + ".".
@@ -796,6 +830,52 @@ pub mod nba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surname_plus_suffix_entries_are_ignored() {
+        // Bug: "Washington Jr." in the vocab turned "Washington Wizards" into
+        // "Washington Jr. Wizards" and "Jackson Gatlin" into "Jackson II Gatlin".
+        let v = Vocab::parse("Washington Jr.\nJackson II\nLucas III\nP.J. Washington\n");
+        assert_eq!(v.names(), vec!["P.J. Washington"]);
+        let (out, c) = v.correct("The Washington Wizards and Jackson Gatlin.", 0.8);
+        assert_eq!(out, "The Washington Wizards and Jackson Gatlin.");
+        assert!(c.is_empty(), "{c:?}");
+    }
+
+    #[test]
+    fn full_names_with_suffixes_still_load() {
+        let v = Vocab::parse("Jaren Jackson Jr.\nDereck Lively II\nJr.\n");
+        assert_eq!(
+            v.names(),
+            vec!["Jaren Jackson Jr.", "Dereck Lively II", "Jr."]
+        );
+    }
+
+    #[test]
+    fn spoken_suffix_is_absorbed_not_doubled() {
+        // Bug: the shorter window won, leaving the speaker's own suffix after the
+        // canonical one: "Mikel Brown Jr. Jr.", "Tim Hardaway Jr. junior".
+        let v = Vocab::parse("Mikel Brown Jr.\nTim Hardaway Jr.\nDereck Lively II\n");
+        let (out, _) = v.correct("They added Michael Brown Jr. And this", 0.8);
+        assert_eq!(out, "They added Mikel Brown Jr. And this");
+        let (out, _) = v.correct("We have Tim Hardaway junior who shoots.", 0.8);
+        assert_eq!(out, "We have Tim Hardaway Jr. who shoots.");
+        let (out, _) = v.correct("Then Derek Lively ii played.", 0.8);
+        assert_eq!(out, "Then Dereck Lively II played.");
+    }
+
+    #[test]
+    fn suffix_is_not_absorbed_across_a_sentence_or_of_another_kind() {
+        let v = Vocab::parse("Tim Hardaway Jr.\nDereck Lively II\n");
+        let (out, _) = v.correct("We have Tim Hardaway. Junior year was rough.", 0.8);
+        assert_eq!(out, "We have Tim Hardaway Jr. Junior year was rough.");
+        let (out, _) = v.correct("Then Derek Lively junior played.", 0.8);
+        assert_eq!(out, "Then Dereck Lively II junior played.");
+        // A name without a suffix never swallows a following "junior".
+        let v = Vocab::parse("Cooper Flagg\n");
+        let (out, _) = v.correct("Cooper Flagg junior season.", 0.8);
+        assert_eq!(out, "Cooper Flagg junior season.");
+    }
 
     #[test]
     fn names_ending_in_a_period_are_not_doubled() {
