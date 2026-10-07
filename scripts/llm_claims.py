@@ -31,7 +31,11 @@ EXTRACTOR_VERSION = "llm-claims-v1"
 PROVIDERS: dict[str, dict[str, Any]] = {
     "anthropic": {"key_env": "ANTHROPIC_API_KEY", "default_model": "claude-opus-5-5"},
     "openai": {"key_env": "OPENAI_API_KEY", "base_url": None, "format": "json_schema"},
-    "deepseek": {"key_env": "DEEPSEEK_API_KEY", "base_url": "https://api.deepseek.com", "format": "json_object"},
+    # DeepSeek's models reason before answering. Unbounded, a full transcript spent the whole 16k
+    # output budget reasoning and returned nothing; with reasoning off, a 2026-10-08 trial invented
+    # names (Batum, Porter Jr.) that low effort did not. Low effort plus 32k output is the setting.
+    "deepseek": {"key_env": "DEEPSEEK_API_KEY", "base_url": "https://api.deepseek.com", "format": "json_object",
+                 "options": {"reasoning_effort": "low"}, "max_tokens": 32000},
     "qwen": {"key_env": "DASHSCOPE_API_KEY", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
              "format": "json_object"},
     "moonshot": {"key_env": "MOONSHOT_API_KEY", "base_url": "https://api.moonshot.ai/v1", "format": "json_object"},
@@ -134,7 +138,10 @@ class Extractor:
 
     def fingerprint(self) -> dict[str, Any]:
         """Everything that determines what the extractor proposes, for the bundle manifest hash."""
-        settings = {"effort": EFFORT} if self.provider == "anthropic" else {"format": self.format, "base_url": self.base_url}
+        spec = PROVIDERS[self.provider]
+        settings = {"effort": EFFORT} if self.provider == "anthropic" else {
+            "format": self.format, "base_url": self.base_url, "options": spec.get("options", {}),
+            "max_tokens": spec.get("max_tokens", OUTPUT_TOKENS)}
         return {"provider": self.provider, "model": self.model, **settings, "version": EXTRACTOR_VERSION, "system": SYSTEM,
                 "schema": SCHEMA, "expiry_days": EXPIRY_DAYS, "max_span": MAX_SPAN}
 
@@ -149,11 +156,25 @@ def name_key(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text)
 
 
-class Catalogue:
-    """Exact (case, accent and punctuation-insensitive) name -> model entity id. No fuzzy matching."""
+SUFFIX = re.compile(r"\s+(jr|sr|ii|iii|iv)\.?$", re.I)
 
-    def __init__(self, players: dict[str, list[tuple[str, bool]]]):
+
+def base_key(name: str) -> str:
+    """Key without a generational suffix: speakers say "Jimmy Butler", the catalogue has "Jimmy Butler III"."""
+    return name_key(SUFFIX.sub("", name.strip()))
+
+
+class Catalogue:
+    """Exact (case, accent and punctuation-insensitive) name -> model entity id. No fuzzy matching.
+
+    A name also matches with its generational suffix dropped, when that is still unambiguous, and
+    through explicit aliases ("Herb Jones => Herbert Jones") for nicknames the catalogue lacks."""
+
+    def __init__(self, players: dict[str, list[tuple[str, bool]]], aliases: dict[str, str] | None = None,
+                 base: dict[str, list[tuple[str, bool]]] | None = None):
         self.players = players
+        self.base = base or {}
+        self.aliases = {name_key(k): v for k, v in (aliases or {}).items()}
         self.teams: dict[str, str] = {}
         nicknames: dict[str, list[int]] = {}
         for team_id, full in TEAMS.items():
@@ -167,23 +188,50 @@ class Catalogue:
                 self.teams.setdefault(nick, f"espn:team:{ids[0]}")
 
     @classmethod
-    def load(cls, athletes_jsonl: Path | None) -> "Catalogue":
+    def load(cls, athletes: Path | list[Path] | None, aliases: Path | None = None) -> "Catalogue":
+        """JSONL rows (athlete_id, name, active) from one or more files, later files adding players
+        the earlier ones lack; aliases lines are `Spoken Name => Catalogue Name`. Missing files are skipped."""
         players: dict[str, list[tuple[str, bool]]] = {}
-        if athletes_jsonl is not None and athletes_jsonl.exists():
-            for line in athletes_jsonl.read_text().splitlines():
-                if line.strip():
-                    row = json.loads(line)
-                    players.setdefault(name_key(row["name"]), []).append((str(row["athlete_id"]), bool(row.get("active"))))
-        return cls(players)
+        base: dict[str, list[tuple[str, bool]]] = {}
+        seen: set[str] = set()
+        for path in [athletes] if isinstance(athletes, Path) else (athletes or []):
+            if not path.exists():
+                continue
+            for line in path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if str(row["athlete_id"]) in seen:
+                    continue
+                seen.add(str(row["athlete_id"]))
+                entry = (str(row["athlete_id"]), bool(row.get("active")))
+                players.setdefault(name_key(row["name"]), []).append(entry)
+                base.setdefault(base_key(row["name"]), []).append(entry)
+        names: dict[str, str] = {}
+        if aliases is not None and aliases.exists():
+            for line in aliases.read_text().splitlines():
+                spoken, sep, canonical = line.split("#", 1)[0].partition("=>")
+                if sep and spoken.strip() and canonical.strip():
+                    names[spoken.strip()] = canonical.strip()
+        return cls(players, names, base)
+
+    @staticmethod
+    def _pick(matches: list[tuple[str, bool]]) -> str | None:
+        active = [m for m in matches if m[1]]
+        chosen = active if len(active) == 1 else matches
+        return f"espn:athlete:{chosen[0][0]}" if len(chosen) == 1 else None
 
     def resolve(self, kind: str, name: str) -> str | None:
         key = name_key(name)
         if kind == "team":
             return self.teams.get(key)
-        matches = self.players.get(key, [])
-        active = [m for m in matches if m[1]]
-        chosen = active if len(active) == 1 else matches
-        return f"espn:athlete:{chosen[0][0]}" if len(chosen) == 1 else None
+        if key in self.aliases:
+            name, key = self.aliases[key], name_key(self.aliases[key])
+        if SUFFIX.search(name.strip()):
+            return self._pick(self.players.get(key, []))
+        # No suffix said: every suffix variant is a candidate, so a spoken "Gary Trent" reaches the
+        # active Gary Trent Jr. rather than his retired father, who matches the bare name exactly.
+        return self._pick(self.base.get(base_key(name)) or self.players.get(key, []))
 
 
 def transcript_prompt(title: str, published: str | None, segments: list[dict[str, Any]]) -> str:
@@ -243,14 +291,16 @@ def openai_call(prompt: str, extractor: Extractor) -> dict[str, Any]:
     if not key:
         raise RuntimeError(f"{PROVIDERS[extractor.provider]['key_env']} is not set")
     client = OpenAI(api_key=key, base_url=extractor.base_url)
+    spec = PROVIDERS[extractor.provider]
+    output_tokens = spec.get("max_tokens", OUTPUT_TOKENS)
     if extractor.format == "json_schema":
         response_format: dict[str, Any] = {"type": "json_schema",
                                            "json_schema": {"name": "claims", "schema": SCHEMA, "strict": True}}
-        limits = {"max_completion_tokens": OUTPUT_TOKENS}
+        limits = {"max_completion_tokens": output_tokens}
     else:
-        response_format, limits = {"type": "json_object"}, {"max_tokens": OUTPUT_TOKENS}
+        response_format, limits = {"type": "json_object"}, {"max_tokens": output_tokens}
     request: dict[str, Any] = {"model": extractor.model, "messages": openai_messages(prompt, extractor.format),
-                               "response_format": response_format, **limits}
+                               "response_format": response_format, **limits, **spec.get("options", {})}
     response = client.chat.completions.create(**request)
     choice = response.choices[0]
     if choice.finish_reason == "length":
@@ -306,12 +356,3 @@ def episode_candidates(
             "entities": entities, "valid_until": valid_until, "audio_checked": False, "notes": ""})
     return candidates, reviews
 
-
-if __name__ == "__main__":
-    # `python3 scripts/llm_claims.py key-env PROVIDER` prints the API key variable (used by daily.sh).
-    import sys
-
-    if len(sys.argv) == 3 and sys.argv[1] == "key-env" and sys.argv[2] in PROVIDERS:
-        print(PROVIDERS[sys.argv[2]]["key_env"])
-    else:
-        sys.exit("usage: llm_claims.py key-env {" + ",".join(PROVIDERS) + "}")

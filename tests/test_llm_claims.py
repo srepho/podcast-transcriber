@@ -193,6 +193,7 @@ class ProviderTests(unittest.TestCase):
             llm.Extractor('nonsense', 'x')
 
     def test_fingerprint_distinguishes_provider_model_and_endpoint(self):
+        self.assertEqual(llm.Extractor('deepseek', 'm').fingerprint()['options'], {'reasoning_effort': 'low'})
         prints = {json.dumps(llm.Extractor(*args).fingerprint(), sort_keys=True) for args in
                   [('deepseek', 'm1'), ('deepseek', 'm2'), ('qwen', 'm1'), ('deepseek', 'm1', 'https://other.example/v1')]}
         self.assertEqual(len(prints), 4)
@@ -215,6 +216,9 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(request['response_format'], {'type': 'json_object'})
         self.assertIn('JSON Schema', request['messages'][0]['content'])
         self.assertEqual(data, {'claims': [{'claim_text': 'x'}]})
+        # DeepSeek reasoning is bounded: low effort and a larger output budget (see PROVIDERS).
+        self.assertEqual(request['reasoning_effort'], 'low')
+        self.assertEqual(request['max_tokens'], 32000)
         self.assertEqual(llm.proposals(data, 5), [])  # unvalidated JSON is still filtered
 
     def test_missing_key_truncation_and_non_object_replies_fail_loudly(self):
@@ -266,3 +270,107 @@ class ReviewCommandTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+daily = load('daily')
+
+
+class DailyRunnerTests(unittest.TestCase):
+    def test_dotenv_reads_only_the_requested_variable(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / '.env'
+            path.write_text('OTHER_SECRET=nope\nexport DEEPSEEK_API_KEY="first"\n# DEEPSEEK_API_KEY=commented\nDEEPSEEK_API_KEY=\'last\'\n')
+            self.assertEqual(daily.dotenv_value(path, 'DEEPSEEK_API_KEY'), 'last')
+            self.assertIsNone(daily.dotenv_value(path, 'MISSING'))
+            with patch.dict('os.environ', {}, clear=True), \
+                    patch.object(daily.subprocess, 'run', return_value=type('P', (), {'returncode': 44, 'stdout': ''})):
+                self.assertTrue(daily.load_key('deepseek', path))
+                self.assertEqual(daily.os.environ['DEEPSEEK_API_KEY'], 'last')
+                self.assertNotIn('OTHER_SECRET', daily.os.environ)
+
+    def test_no_key_anywhere_is_reported(self):
+        with patch.dict('os.environ', {}, clear=True), \
+                patch.object(daily.subprocess, 'run', return_value=type('P', (), {'returncode': 44, 'stdout': ''})):
+            self.assertFalse(daily.load_key('qwen', None))
+
+    def test_summary(self):
+        manifest = {'counts': {'candidates.jsonl': 7, 'episodes.jsonl': 2}, 'extraction_failures': [{}]}
+        self.assertEqual(daily.summary(manifest), '7 claims from 2 episodes, 1 failed')
+
+
+class CatalogueMatchingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        (root / 'history.jsonl').write_text('\n'.join(json.dumps(r) for r in [
+            {'athlete_id': '1', 'name': 'Gary Trent', 'active': False},
+            {'athlete_id': '2', 'name': 'Gary Trent Jr.', 'active': True},
+            {'athlete_id': '3', 'name': 'Jimmy Butler III', 'active': True},
+            {'athlete_id': '4', 'name': 'Glenn Robinson', 'active': False},
+            {'athlete_id': '5', 'name': 'Glenn Robinson III', 'active': False},
+            {'athlete_id': '6', 'name': 'Herbert Jones', 'active': True}]) + '\n')
+        (root / 'rosters.jsonl').write_text(json.dumps({'athlete_id': '7', 'name': 'Thomas Sorber', 'active': True}) + '\n'
+                                            + json.dumps({'athlete_id': '6', 'name': 'Herb Jones', 'active': True}) + '\n')
+        (root / 'aliases.txt').write_text('# nicknames\nLu Dort => Luguentz Dort\nHerb Jones => Herbert Jones\n')
+        self.catalogue = llm.Catalogue.load([root / 'history.jsonl', root / 'rosters.jsonl', root / 'missing.jsonl'],
+                                            root / 'aliases.txt')
+
+    def test_suffix_is_optional_when_unambiguous(self):
+        # Invariant: a name spoken without its suffix reaches the single active suffix variant.
+        self.assertEqual(self.catalogue.resolve('player', 'Jimmy Butler'), 'espn:athlete:3')
+        self.assertEqual(self.catalogue.resolve('player', 'Gary Trent'), 'espn:athlete:2')  # not the retired father
+        self.assertEqual(self.catalogue.resolve('player', 'Gary Trent Jr.'), 'espn:athlete:2')
+        self.assertIsNone(self.catalogue.resolve('player', 'Glenn Robinson'))  # two inactive candidates
+
+    def test_a_spoken_suffix_must_match_exactly(self):
+        self.assertIsNone(self.catalogue.resolve('player', 'Herbert Jones Jr.'))
+
+    def test_later_files_add_players_and_aliases_map_nicknames(self):
+        self.assertEqual(self.catalogue.resolve('player', 'Thomas Sorber'), 'espn:athlete:7')
+        self.assertEqual(self.catalogue.resolve('player', 'Herb Jones'), 'espn:athlete:6')
+        self.assertIsNone(self.catalogue.resolve('player', 'Lu Dort'))  # alias target not in the catalogue
+
+
+class DuplicateReviewTests(unittest.TestCase):
+    def entry(self, cid, text, status='pending', kind='contract', ids=('espn:athlete:9', 'espn:team:8')):
+        return {'candidate_id': cid, 'status': status, 'claim_type': kind, 'claim_text': text,
+                'entities': [{'type': 'player' if i.startswith('espn:athlete') else 'team', 'name': i, 'model_entity_id': i}
+                             for i in ids]}
+
+    def test_related_needs_same_type_and_players_and_ranks_by_text(self):
+        item = self.entry('new', 'Jalen Duren signed a five-year, $200 million extension.')
+        decided = [self.entry('a', 'Jalen Duren signed a five-year $200 million extension with Detroit.', 'accepted'),
+                   self.entry('b', 'The Pistons worried about Duren conditioning.', 'rejected'),
+                   self.entry('c', 'Jalen Duren signed.', 'accepted', kind='transaction'),
+                   self.entry('d', 'Same player, other team.', 'accepted', ids=('espn:athlete:9',)),
+                   self.entry('e', 'Other player.', 'accepted', ids=('espn:athlete:1', 'espn:team:8'))]
+        self.assertEqual([d['candidate_id'] for d in reviewer.related(item, decided)], ['a', 'd'])
+        self.assertEqual(reviewer.related(self.entry('x', 'Unmapped', ids=()), decided), [])
+
+    def test_duplicate_command(self):
+        item, original = self.entry('new', 'x'), self.entry('a', 'Duren signed.', 'accepted')
+        self.assertEqual(reviewer.apply(item, 'd', None, 'me'), (False, 'no related decided claim to mark this a duplicate of'))
+        self.assertEqual(reviewer.apply(item, 'd', None, 'me', [original]), (True, 'rejected as duplicate'))
+        self.assertEqual(item['status'], 'rejected')
+        self.assertIn('Duplicate of a', item['notes'])
+
+    def test_remap_fills_only_pending_unmapped_entities(self):
+        catalogue = llm.Catalogue({llm.name_key('Alex Example'): [('1', True)]})
+        data = {'reviews': [
+            {'status': 'pending', 'entities': [{'type': 'player', 'name': 'Alex Example', 'model_entity_id': ''}]},
+            {'status': 'rejected', 'entities': [{'type': 'player', 'name': 'Alex Example', 'model_entity_id': ''}]}]}
+        self.assertEqual(reviewer.remap(data, catalogue), 1)
+        self.assertEqual(data['reviews'][0]['entities'][0]['model_entity_id'], 'espn:athlete:1')
+        self.assertEqual(data['reviews'][1]['entities'][0]['model_entity_id'], '')
+
+    def test_other_bundles_decisions_are_seen_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for name in ('one', 'one-reviewed', 'mine'):
+                (root / name).mkdir()
+            decided = {'reviews': [self.entry('a', 'Duren signed.', 'accepted'), self.entry('p', 'pending one')]}
+            for name in ('one', 'one-reviewed'):
+                (root / name / 'review.json').write_text(json.dumps(decided))
+            (root / 'mine' / 'review.json').write_text(json.dumps({'reviews': [self.entry('m', 'mine', 'accepted')]}))
+            self.assertEqual([r['candidate_id'] for r in reviewer.decided_elsewhere(root / 'mine')], ['a'])

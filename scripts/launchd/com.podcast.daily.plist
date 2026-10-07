@@ -3,19 +3,26 @@
 <!-- Template: replace __REPO__, __FEED__, __AFTER__ and __LOGS__, copy to ~/Library/LaunchAgents/,
      then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.podcast.daily.plist`.
      Keep __LOGS__ outside ~/Downloads, ~/Documents and ~/Desktop: launchd jobs cannot write there
-     without Full Disk Access and fail before running. -->
+     without Full Disk Access and fail before running. The program is the venv's Python, not
+     /bin/bash: macOS grants folder access per executable, and bash reading a script under
+     ~/Downloads fails with "Operation not permitted" (exit 126). -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.podcast.daily</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
-    <string>__REPO__/scripts/daily.sh</string>
+    <string>__REPO__/.venv/bin/python</string>
+    <string>__REPO__/scripts/daily.py</string>
     <string>__FEED__</string>
     <string>__AFTER__</string>
   </array>
-  <!-- Optional: <key>EnvironmentVariables</key><dict><key>PROVIDER</key><string>deepseek</string>
-       <key>MODEL</key><string>...</string></dict> -->
+  <!-- launchd's default PATH has no Homebrew; without it `podcast run` cannot find ffmpeg.
+       Add PROVIDER, MODEL, BASE_URL or ENV_FILE here as needed. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key><string>__REPO__</string>
   <key>StartInterval</key><integer>21600</integer>
   <key>RunAtLoad</key><false/>
   <key>LowPriorityIO</key><true/>

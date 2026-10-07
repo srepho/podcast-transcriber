@@ -152,7 +152,7 @@ rules and a separate validation policy.
 
 ## Scheduled collection and LLM-proposed claims
 
-`scripts/daily.sh FEED PUBLISHED_AFTER` runs `podcast run` (refresh, download, transcribe) and then
+`scripts/daily.py FEED PUBLISHED_AFTER` runs `podcast run` (refresh, download, transcribe) and then
 
 ```sh
 python scripts/pilot_dataset.py build --feed FEED --unprocessed --published-after 2026-10-01T00:00:00Z \
@@ -174,16 +174,21 @@ the built-in ESPN team table; ambiguous or unknown names stay unmapped for the r
 
 Providers: `anthropic` (default model `claude-opus-5-5`, schema enforced, server-side refusal
 fallback), `openai` (strict JSON schema), and OpenAI-compatible `deepseek`, `qwen`, `moonshot`,
-`zhipu` or `compatible` with `--base-url`. Non-Anthropic providers need `--model`. The
+`zhipu` or `compatible` with `--base-url`. Non-Anthropic providers need `--model`. Per-provider request
+options live in `PROVIDERS`: DeepSeek runs at `reasoning_effort: low` with a 32k output limit,
+because unbounded reasoning used the whole output budget on a full transcript and reasoning off
+produced confidently wrong names. The
 compatible providers only guarantee JSON, so the schema is stated in the prompt and the validator
 does the rest. Provider, model and endpoint are part of the manifest's `extractor_sha256` and each
 candidate's `extractor_model`; compare extractors on the same episodes before switching. Keys come
-from each provider's usual environment variable or the keychain service `podcast-<provider>`.
+from each provider's usual environment variable, the keychain service `podcast-<provider>`, or
+`ENV_FILE` (a dotenv file from which only that variable is read).
 
 Review with `python3 scripts/review_claims.py BUNDLE --finalize`: accept, reject, edit text,
 certainty or expiry, or set an entity's model ID. Acceptance still requires mapped IDs and an
 expiry, and records `audio_checked: false`. `scripts/launchd/com.podcast.daily.plist` is a template
-for running the job every six hours; keep its log path outside `~/Downloads`, `~/Documents` and
+for running the job every six hours through the venv's Python (launchd cannot run a bash script
+under `~/Downloads`); keep its log path outside `~/Downloads`, `~/Documents` and
 `~/Desktop`.
 
 Sending transcripts to a provider subjects private source material to that provider's retention

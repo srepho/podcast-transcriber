@@ -481,8 +481,9 @@ def main():
     build_parser.add_argument("--unprocessed", action="store_true",
                               help="Only transcribed episodes not yet extracted; exits quietly when there are none")
     build_parser.add_argument("--published-after", help="Required with --unprocessed (ISO 8601 with timezone)")
-    build_parser.add_argument("--athletes", type=Path,
-                              help="athletes.jsonl (athlete_id, name, active) for exact ESPN id mapping")
+    build_parser.add_argument("--athletes", type=Path, action="append",
+                              help="JSONL (athlete_id, name, active) for exact ESPN id mapping; repeatable")
+    build_parser.add_argument("--entity-aliases", type=Path, help="Lines of `Spoken Name => Catalogue Name`")
     finish = commands.add_parser("finalize")
     finish.add_argument("--bundle", type=Path, required=True)
     finish.add_argument("--review", type=Path, required=True)
@@ -503,10 +504,10 @@ def main():
     if command == "finalize":
         args["review_path"] = args.pop("review")
     if command == "build":
-        athletes = args.pop("athletes")
+        athletes, aliases = args.pop("athletes"), args.pop("entity_aliases")
         if args["extractor"] == "llm":
             import llm_claims
-            args["catalogue"] = llm_claims.Catalogue.load(athletes)
+            args["catalogue"] = llm_claims.Catalogue.load(athletes, aliases)
     try:
         handlers: dict[str, Callable[..., Any]] = {"build": build, "finalize": finalize, "select": select}
         result = handlers[command](**args)
