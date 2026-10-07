@@ -3,7 +3,8 @@
 The initial goal is to assess whether episode evidence can be extracted accurately and
 later add predictive value. This pilot does not infer market probabilities or place orders.
 Core collection remains a Rust CLI; the optional research exporter uses Python 3.10+
-standard-library modules only (development tools: `uv sync`). No transcripts are sent to an external service.
+standard-library modules only (development tools: `uv sync`). The default keyword extractor sends
+nothing to an external service; the optional LLM extractor (below) sends each transcript to the chosen provider.
 
 ## Collect a bounded sample
 
@@ -148,3 +149,42 @@ Expiry is a feature-freshness requirement, not a claim that an injury has healed
 has ceased to exist. Define it before fixture evaluation; do not extend it merely to obtain
 eligible observations. Longer-lived offseason state features need explicit update/supersession
 rules and a separate validation policy.
+
+## Scheduled collection and LLM-proposed claims
+
+`scripts/daily.sh FEED PUBLISHED_AFTER` runs `podcast run` (refresh, download, transcribe) and then
+
+```sh
+python scripts/pilot_dataset.py build --feed FEED --unprocessed --published-after 2026-10-01T00:00:00Z \
+  --extractor llm --provider anthropic --athletes athletes.jsonl --out data/pilots/auto-<UTC stamp>
+```
+
+`--unprocessed` selects transcribed episodes published after the floor that no earlier unprocessed
+build has extracted (`data/pilots/extracted.json`), and writes nothing when there are none. An episode
+whose extraction fails stays in the bundle as `extraction_failed`, is listed in the manifest's
+`extraction_failures`, and is retried by the next run.
+
+The LLM extractor (`scripts/llm_claims.py`, `uv sync --group extract`) makes one structured-output
+request per transcript and turns each proposed claim into an ordinary candidate whose review entry
+is pre-filled but still `pending`: claim text, type, certainty, temporal scope, entities, and an
+expiry of publication plus a fixed per-type window (`EXPIRY_DAYS`). Proposals citing segments that
+do not exist, spans longer than `MAX_SPAN`, or invalid labels are dropped, never repaired. Entity IDs
+come only from an exact (case-, accent- and punctuation-insensitive) match against `--athletes` and
+the built-in ESPN team table; ambiguous or unknown names stay unmapped for the reviewer.
+
+Providers: `anthropic` (default model `claude-opus-5-5`, schema enforced, server-side refusal
+fallback), `openai` (strict JSON schema), and OpenAI-compatible `deepseek`, `qwen`, `moonshot`,
+`zhipu` or `compatible` with `--base-url`. Non-Anthropic providers need `--model`. The
+compatible providers only guarantee JSON, so the schema is stated in the prompt and the validator
+does the rest. Provider, model and endpoint are part of the manifest's `extractor_sha256` and each
+candidate's `extractor_model`; compare extractors on the same episodes before switching. Keys come
+from each provider's usual environment variable or the keychain service `podcast-<provider>`.
+
+Review with `python3 scripts/review_claims.py BUNDLE --finalize`: accept, reject, edit text,
+certainty or expiry, or set an entity's model ID. Acceptance still requires mapped IDs and an
+expiry, and records `audio_checked: false`. `scripts/launchd/com.podcast.daily.plist` is a template
+for running the job every six hours; keep its log path outside `~/Downloads`, `~/Documents` and
+`~/Desktop`.
+
+Sending transcripts to a provider subjects private source material to that provider's retention
+policy and jurisdiction. Check the provider's terms before scheduling it.

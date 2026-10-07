@@ -8,6 +8,10 @@ dependencies = []
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+extract = [
+    "anthropic>=1.11.0",
+    "openai>=3.26.0",
+]
 
 [tool.uv]
 package = false

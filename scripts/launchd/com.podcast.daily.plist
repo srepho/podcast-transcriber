@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: replace __REPO__, __FEED__, __AFTER__ and __LOGS__, copy to ~/Library/LaunchAgents/,
+     then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.podcast.daily.plist`.
+     Keep __LOGS__ outside ~/Downloads, ~/Documents and ~/Desktop: launchd jobs cannot write there
+     without Full Disk Access and fail before running. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.podcast.daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/scripts/daily.sh</string>
+    <string>__FEED__</string>
+    <string>__AFTER__</string>
+  </array>
+  <!-- Optional: <key>EnvironmentVariables</key><dict><key>PROVIDER</key><string>deepseek</string>
+       <key>MODEL</key><string>...</string></dict> -->
+  <key>StartInterval</key><integer>21600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key><string>__LOGS__/daily.log</string>
+  <key>StandardErrorPath</key><string>__LOGS__/daily.log</string>
+</dict>
+</plist>

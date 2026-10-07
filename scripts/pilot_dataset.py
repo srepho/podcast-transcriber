@@ -102,18 +102,46 @@ def check_time(value):
     return value
 
 
-def build(data_dir, feed, title, limit, out):
+def extracted_path(data_dir):
+    return data_dir / "pilots" / "extracted.json"
+
+
+def build(data_dir, feed, title, limit, out, extractor="keyword", unprocessed=False, published_after=None,
+          catalogue=None, call=None, provider="anthropic", model=None, base_url=None):
+    """Export a review bundle. `unprocessed` selects transcribed episodes not yet extracted by any earlier
+    unprocessed build (tracked in pilots/extracted.json) and returns None when there are none."""
     if not 1 <= limit <= 10:
         raise ValueError("pilot limit must be 1..10")
+    if extractor not in ("keyword", "llm"):
+        raise ValueError("extractor must be keyword or llm")
+    if unprocessed and published_after is None:
+        raise ValueError("--unprocessed needs --published-after so the backlog is never extracted by accident")
     generated = now()
     with closing(sqlite3.connect(data_dir.joinpath("podcast.db").resolve().as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
         # Select the cohort before checking transcription availability; missing records stay visible.
         episodes = [dict(r) for r in db.execute(
             "SELECT * FROM episodes WHERE feed_name=? ORDER BY published DESC, guid", (feed,)
-        ) if title.casefold() in (r["title"] or "").casefold()][:limit]
+        ) if title.casefold() in (r["title"] or "").casefold()]
+    if unprocessed:
+        state = json.loads(extracted_path(data_dir).read_text()) if extracted_path(data_dir).exists() else {}
+        floor = timestamp(published_after)
+        episodes = [ep for ep in episodes if ep["status"] == "transcribed" and ep["published"]
+                    and timestamp(ep["published"]) >= floor and digest(encoded([feed, ep["guid"]])) not in state]
+        if not episodes:
+            return None
+    episodes = episodes[:limit]
     if not episodes:
         raise ValueError("no matching episodes")
+    llm: Any = None
+    engine: Any = None
+    if extractor == "llm":
+        import llm_claims  # needs the `extract` dependency group; keyword mode stays stdlib-only
+
+        llm = llm_claims
+        engine = llm.Extractor(provider, model, base_url)
+        catalogue = catalogue if catalogue is not None else llm.Catalogue(players={})
+    failures: list[dict[str, str]] = []
     terms = []
     vocab = data_dir / "vocab" / f"{feed}.txt"
     vocab_sha256 = digest(vocab.read_bytes()) if vocab.exists() else None
@@ -163,7 +191,7 @@ def build(data_dir, feed, title, limit, out):
                                  "corrected_text": segment["text"],
                                  "transcript_sha256": row["transcript_sha256"]})
                 kinds = [kind for kind, pattern in KINDS.items() if re.search(pattern, segment["text"], re.I)]
-                if not kinds:
+                if extractor != "keyword" or not kinds:
                     continue
                 lo, hi = max(0, index - 1), min(len(items), index + 2)
                 text = " ".join(s["text"].strip() for s in items[lo:hi])
@@ -180,16 +208,33 @@ def build(data_dir, feed, title, limit, out):
                 reviews.append({"candidate_id": candidate_id, "status": "pending", "claim_type": kinds[0],
                     "claim_text": "", "certainty": "unknown", "temporal_scope": "unknown", "entities": [], "valid_until": None,
                     "audio_checked": False, "notes": ""})
+            if llm is not None:
+                episode_segments = [s for s in segments if s["episode_id"] == episode_id]
+                try:
+                    found, proposed = llm.episode_candidates(
+                        episode_id, row["transcript_sha256"], ep["title"], row["published_at"], episode_segments,
+                        catalogue, lambda value: digest(encoded(value)), timestamp,
+                        call if call is not None else engine, engine.name)
+                except Exception as error:  # one failed episode must not discard the others; it is retried later
+                    failures.append({"episode_id": episode_id, "error": f"{type(error).__name__}: {error}"})
+                    row["audit_status"] = "extraction_failed"
+                else:
+                    candidates += [{"schema_version": SCHEMA_VERSION, **c} for c in found]
+                    reviews += proposed
         episode_rows.append(row)
     files = {"episodes.jsonl": episode_rows, "segments.jsonl": segments, "candidates.jsonl": candidates}
     with new_directory(out) as staging:
         for name, rows in files.items():
             write_rows(staging / name, rows)
-        manifest = {"schema_version": SCHEMA_VERSION, "extractor_version": EXTRACTOR_VERSION,
-                    "extractor_sha256": digest(encoded({"kinds": KINDS, "uncertainty": UNCERTAINTY})),
+        fingerprint = engine.fingerprint() if engine is not None else {"kinds": KINDS, "uncertainty": UNCERTAINTY}
+        manifest = {"schema_version": SCHEMA_VERSION,
+                    "extractor_version": llm.EXTRACTOR_VERSION if llm is not None else EXTRACTOR_VERSION,
+                    "extractor_model": engine.name if engine is not None else None,
+                    "extractor_sha256": digest(encoded(fingerprint)), "extraction_failures": failures,
                     "vocab_sha256": vocab_sha256,
                     "generated_at": generated, "sampling": {"feed": feed, "title_contains": title,
-                    "requested": limit, "selected": len(episodes), "order": "newest_publication_first"},
+                    "requested": limit, "selected": len(episodes), "order": "newest_publication_first",
+                    "unprocessed_only": unprocessed, "published_after": published_after},
                     "counts": {name: len(rows) for name, rows in files.items()},
                     "files": {name: digest((staging / name).read_bytes()) for name in files},
                     "availability_policy": "reviewed records become available when finalized; publication is not availability"}
@@ -198,6 +243,13 @@ def build(data_dir, feed, title, limit, out):
                    "manifest_sha256": digest((staging / "manifest.json").read_bytes()),
                    "reviewer": "", "reviews": reviews})
         write_review_notes(staging / "REVIEW.md", episode_rows, candidates)
+    if unprocessed:
+        failed = {f["episode_id"] for f in failures}
+        state = json.loads(extracted_path(data_dir).read_text()) if extracted_path(data_dir).exists() else {}
+        state.update({row["episode_id"]: out.name for row in episode_rows
+                      if row["audit_status"] == "ready_for_review" and row["episode_id"] not in failed})
+        extracted_path(data_dir).parent.mkdir(parents=True, exist_ok=True)
+        write_json(extracted_path(data_dir), state)
     return manifest
 
 
@@ -420,6 +472,17 @@ def main():
     build_parser.add_argument("--title", default="")
     build_parser.add_argument("--limit", type=int, default=5)
     build_parser.add_argument("--out", type=Path, required=True)
+    build_parser.add_argument("--extractor", choices=["keyword", "llm"], default="keyword",
+                              help="llm sends each transcript to --provider to propose claims")
+    build_parser.add_argument("--provider", default="anthropic",
+                              help="anthropic, openai, deepseek, qwen, moonshot, zhipu or compatible")
+    build_parser.add_argument("--model", help="Required for every provider except anthropic")
+    build_parser.add_argument("--base-url", help="Override the provider endpoint (required for compatible)")
+    build_parser.add_argument("--unprocessed", action="store_true",
+                              help="Only transcribed episodes not yet extracted; exits quietly when there are none")
+    build_parser.add_argument("--published-after", help="Required with --unprocessed (ISO 8601 with timezone)")
+    build_parser.add_argument("--athletes", type=Path,
+                              help="athletes.jsonl (athlete_id, name, active) for exact ESPN id mapping")
     finish = commands.add_parser("finalize")
     finish.add_argument("--bundle", type=Path, required=True)
     finish.add_argument("--review", type=Path, required=True)
@@ -439,11 +502,19 @@ def main():
     command = args.pop("command")
     if command == "finalize":
         args["review_path"] = args.pop("review")
+    if command == "build":
+        athletes = args.pop("athletes")
+        if args["extractor"] == "llm":
+            import llm_claims
+            args["catalogue"] = llm_claims.Catalogue.load(athletes)
     try:
         handlers: dict[str, Callable[..., Any]] = {"build": build, "finalize": finalize, "select": select}
         result = handlers[command](**args)
     except (ValueError, KeyError, TypeError, OSError, sqlite3.Error) as error:
         parser.exit(1, f"error: {error}\n")
+    if result is None:
+        print(json.dumps({"new_episodes": 0}))
+        return
     print(json.dumps(result.get("counts", {}) if isinstance(result, dict) else {"records": len(result)}))
 
 
