@@ -449,3 +449,51 @@ class FinalizeVersionTests(unittest.TestCase):
                 reviewer.finalize_version(pilots / 'auto-1', failing)
             self.assertTrue((pilots / 'auto-1-reviewed').exists())
             self.assertFalse((pilots / 'superseded').exists())
+
+
+export_claims = load('export_claims')
+
+
+class ClaimsFeedTests(ClaudeBundleTests):
+    def export(self):
+        pilots = self.root / 'pilots'
+        pilots.mkdir(exist_ok=True)
+        for p in self.root.glob('auto*'):
+            p.rename(pilots / p.name)
+        manifest = export_claims.export(pilots, self.root / 'exports')
+        rows = [json.loads(line) for line in (self.root / 'exports' / export_claims.FEED).read_text().splitlines()]
+        return manifest, rows, pilots
+
+    def test_every_proposal_is_exported_with_extraction_time_as_availability(self):
+        # Invariant: one row per candidate; available_at is the bundle's extraction time, never publication.
+        self.build('auto1')
+        manifest, rows, _ = self.export()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r['available_at'] for r in rows}, {'2024-03-03T00:00:00+00:00'})
+        self.assertEqual({r['published_at'] for r in rows}, {'2024-03-01T00:00:00Z', '2024-03-02T00:00:00Z'})
+        self.assertEqual({r['review_status'] for r in rows}, {'pending'})
+        self.assertEqual(rows[0]['subject_key'], 'injury|espn:athlete:123')
+        data = (self.root / 'exports' / export_claims.FEED).read_bytes()
+        self.assertEqual(manifest['sha256'], __import__('hashlib').sha256(data).hexdigest())
+        self.assertEqual(manifest['review_status_counts'], {'pending': 2})
+
+    def test_review_and_finalization_are_reflected(self):
+        self.build('auto1')
+        bundle = self.root / 'auto1'
+        answers = iter(['a', 'r'])
+        reviewer.review(bundle, 'tester', read=lambda _: next(answers))
+        with patch.object(pilot, 'now', return_value='2024-03-04T00:00:00+00:00'):
+            pilot.finalize(bundle, bundle / 'review.json', self.root / 'auto1-reviewed')
+        _, rows, _ = self.export()
+        by_status = {r['review_status']: r for r in rows}
+        self.assertEqual(by_status['accepted']['finalized_status'], 'accepted')
+        self.assertEqual(by_status['accepted']['model_ready_at'], '2024-03-04T00:00:00+00:00')
+        self.assertIsNone(by_status['rejected']['model_ready_at'])
+        self.assertEqual(by_status['accepted']['reviewer'], 'tester')
+
+    def test_keyword_bundles_and_finalized_copies_are_not_rows(self):
+        self.build('auto1')
+        with patch.object(pilot, 'now', return_value='2024-03-03T00:00:00+00:00'):
+            pilot.build(self.root, 'demo', 'Show 3', 1, self.root / 'keyword')  # keyword extractor, Jan episode
+        _, rows, _ = self.export()
+        self.assertEqual({r['bundle'] for r in rows}, {'auto1'})

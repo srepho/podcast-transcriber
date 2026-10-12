@@ -22,6 +22,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
+import export_claims  # noqa: E402
 import llm_claims  # noqa: E402
 import pilot_dataset  # noqa: E402
 
@@ -78,6 +79,15 @@ def load_key(provider, env_file=None):
     return bool(value)
 
 
+def export_feed():
+    """Refresh the unreviewed claims feed (data/exports). Never fatal: the bundles are the record."""
+    try:
+        manifest = export_claims.export(REPO / "data/pilots", REPO / "data/exports")
+        log(f"claims feed: {manifest['rows']} rows {manifest['review_status_counts']}")
+    except Exception as error:
+        print(f"claims feed export failed: {type(error).__name__}: {error}", file=sys.stderr)
+
+
 def summary(manifest):
     failed = len(manifest["extraction_failures"])
     counts = manifest["counts"]
@@ -86,6 +96,13 @@ def summary(manifest):
 
 
 def main(argv=None):
+    try:
+        return run(argv)
+    finally:
+        export_feed()  # every run, so review decisions reach the feed even when nothing new arrived
+
+
+def run(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("feed")
     parser.add_argument("published_after")

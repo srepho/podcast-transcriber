@@ -205,3 +205,15 @@ under `~/Downloads`); keep its log path outside `~/Downloads`, `~/Documents` and
 
 Sending transcripts to a provider subjects private source material to that provider's retention
 policy and jurisdiction. Check the provider's terms before scheduling it.
+
+## Unreviewed claims feed
+
+`scripts/export_claims.py` (run by `daily.py` after every run) writes `data/exports/claims_feed.jsonl`
+and `claims_feed.manifest.json` (row count, SHA-256, status counts): one row per LLM-proposed claim
+with its current review status (pending, accepted or rejected), reviewer and notes, the finalized
+status and `model_ready_at` when a finalized version exists, entities, evidence, extractor model, a
+`subject_key` grouping the same fact across episodes, and the extractor's `advisory_valid_until`.
+It is a separate input for a downstream model that chooses for itself; the finalized-bundle contract
+above is unchanged. `available_at` is the extraction time, not publication: a backfilled episode's
+claims become available when they were extracted, and a retrospective study using `published_at`
+must declare its own processing delay. Keyword-hint bundles are not exported.
