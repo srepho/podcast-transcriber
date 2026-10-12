@@ -2,6 +2,10 @@
 """Review pending claim proposals in a pilot bundle from the terminal, then optionally finalize.
 
     python3 scripts/review_claims.py data/pilots/auto-20261008T0600Z [--reviewer NAME] [--finalize]
+        [--live-only] [--types injury,rotation]
+
+--live-only skips entries whose expiry has passed (they stay pending, so they are never used);
+--types limits the session to those claim types. Skipped entries can be reviewed in a later run.
 
 Each pending entry shows the proposal, its transcript evidence, the mapped model entity IDs and
 related claims already decided (same type and same players, in this or any other bundle).
@@ -20,7 +24,7 @@ import os
 import sys
 import tempfile
 import textwrap
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location("pilot_dataset", Path(__file__).with_name("pilot_dataset.py"))
@@ -161,7 +165,16 @@ def show(item, candidate, episode, position, total, similar=()):
         print(f"  Related [{other['status']}]: {other['claim_text']}")
 
 
-def review(bundle, reviewer, read=input, catalogue=None):
+def wanted(item, live_only=False, types=None, now=None):
+    """Whether a pending entry belongs in this session under the triage filters."""
+    if types and item.get("claim_type") not in types:
+        return False
+    if live_only and item.get("valid_until"):
+        return pilot.timestamp(item["valid_until"]) > (now or datetime.now(timezone.utc))
+    return True
+
+
+def review(bundle, reviewer, read=input, catalogue=None, live_only=False, types=None):
     review_path = bundle / "review.json"
     data = json.loads(review_path.read_text())
     data["reviewer"] = data.get("reviewer") or reviewer
@@ -174,6 +187,10 @@ def review(bundle, reviewer, read=input, catalogue=None):
     candidates = {c["candidate_id"]: c for c in pilot.read_rows(bundle / "candidates.jsonl")}
     episodes = {e["episode_id"]: e for e in pilot.read_rows(bundle / "episodes.jsonl")}
     pending = [r for r in data["reviews"] if r["status"] == "pending"]
+    selected = [r for r in pending if wanted(r, live_only, types)]
+    if len(selected) < len(pending):
+        print(f"{len(selected)} of {len(pending)} pending entries match the filters; the rest stay pending")
+    pending = selected
     for position, item in enumerate(pending, 1):
         candidate = candidates[item["candidate_id"]]
         episode = episodes[candidate["episode_id"]]
@@ -203,7 +220,12 @@ def main():
     parser.add_argument("--finalize", action="store_true", help="Freeze the review into <bundle>-reviewed afterwards")
     parser.add_argument("--athletes", type=Path, action="append", help="Catalogue JSONL for re-mapping; repeatable")
     parser.add_argument("--entity-aliases", type=Path)
+    parser.add_argument("--live-only", action="store_true", help="Skip entries whose expiry has already passed")
+    parser.add_argument("--types", help="Comma-separated claim types to review, e.g. injury,rotation")
     args = parser.parse_args()
+    types = {t.strip() for t in args.types.split(",") if t.strip()} if args.types else None
+    if types and not types <= set(pilot.KINDS):
+        sys.exit(f"unknown claim types: {', '.join(sorted(types - set(pilot.KINDS)))}")
     catalogue = None
     try:
         sys.path.insert(0, str(Path(__file__).parent))
@@ -214,7 +236,7 @@ def main():
                                               args.entity_aliases or daily.DEFAULT_ALIASES)
     except ImportError:
         pass  # re-mapping is a convenience; review works without it
-    data = review(args.bundle, args.reviewer, catalogue=catalogue)
+    data = review(args.bundle, args.reviewer, catalogue=catalogue, live_only=args.live_only, types=types)
     counts = {s: sum(r["status"] == s for r in data["reviews"]) for s in ("accepted", "rejected", "pending")}
     print(json.dumps(counts))
     if args.finalize:

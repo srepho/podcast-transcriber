@@ -29,6 +29,19 @@ import pilot_dataset  # noqa: E402
 DEFAULT_ATHLETES = [REPO.parent / "PredictionMarkets/data/basketball/nba/players/athletes.jsonl",
                     REPO / "data/vocab/espn_rosters.jsonl"]
 DEFAULT_ALIASES = REPO / "data/vocab/entity_aliases.txt"
+MODEL_REPO = REPO.parent / "PredictionMarkets"
+
+
+def refresh_rosters():
+    """Re-export current rosters when the prediction model's copy is newer. Never fatal: a stale
+    catalogue only leaves more names for the reviewer to map."""
+    python = MODEL_REPO / ".venv/bin/python"
+    rosters = MODEL_REPO / "data/basketball/sdv/nba/rosters"
+    if not python.exists() or not rosters.is_dir():
+        return
+    done = subprocess.run([str(python), str(REPO / "scripts/export_rosters.py"), str(rosters),
+                           str(DEFAULT_ATHLETES[1])], capture_output=True, text=True, check=False)
+    print((done.stdout or done.stderr).strip() or f"roster export exited {done.returncode}", flush=True)
 
 
 def log(message):
@@ -99,6 +112,8 @@ def main(argv=None):
         print(f"no {args.provider} API key; skipping extraction", file=sys.stderr)
         notify(f"No {args.provider} API key; claims not extracted")
         return 1
+    if not args.athletes:
+        refresh_rosters()
     out = REPO / "data/pilots" / f"auto-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%MZ')}"
     log(f"extract with {args.provider}:{args.model or 'default'} -> {out.relative_to(REPO)}")
     try:

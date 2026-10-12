@@ -185,7 +185,15 @@ from each provider's usual environment variable, the keychain service `podcast-<
 `ENV_FILE` (a dotenv file from which only that variable is read).
 
 Review with `python3 scripts/review_claims.py BUNDLE --finalize`: accept, reject, edit text,
-certainty or expiry, or set an entity's model ID. Acceptance still requires mapped IDs and an
+certainty or expiry, or set an entity's model ID; `d` rejects a claim as a duplicate of the closest
+related decision (same type and players, in any bundle). Unmapped entities are re-resolved against
+the current catalogue when a bundle is opened. For a backlog, `--live-only` skips entries already
+past their expiry and `--types injury,rotation` limits the session; skipped entries stay pending.
+
+The catalogue is the ESPN athlete history plus `data/vocab/espn_rosters.jsonl` (current rosters,
+re-exported by `daily.py` through `scripts/export_rosters.py` whenever the prediction model's roster
+parquet is newer) and optional nickname aliases in `data/vocab/entity_aliases.txt`. A name matches
+without its generational suffix only when that is unambiguous, preferring the single active player. Acceptance still requires mapped IDs and an
 expiry, and records `audio_checked: false`. `scripts/launchd/com.podcast.daily.plist` is a template
 for running the job every six hours through the venv's Python (launchd cannot run a bash script
 under `~/Downloads`); keep its log path outside `~/Downloads`, `~/Documents` and

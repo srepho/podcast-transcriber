@@ -374,3 +374,44 @@ class DuplicateReviewTests(unittest.TestCase):
                 (root / name / 'review.json').write_text(json.dumps(decided))
             (root / 'mine' / 'review.json').write_text(json.dumps({'reviews': [self.entry('m', 'mine', 'accepted')]}))
             self.assertEqual([r['candidate_id'] for r in reviewer.decided_elsewhere(root / 'mine')], ['a'])
+
+
+class TriageTests(unittest.TestCase):
+    NOW = pilot.timestamp('2026-10-12T00:00:00Z')
+
+    def test_live_only_and_types(self):
+        live = {'claim_type': 'injury', 'valid_until': '2026-10-13T00:00:00+00:00'}
+        stale = {'claim_type': 'injury', 'valid_until': '2026-10-11T00:00:00+00:00'}
+        no_expiry = {'claim_type': 'contract', 'valid_until': None}
+        self.assertTrue(reviewer.wanted(live, live_only=True, now=self.NOW))
+        self.assertFalse(reviewer.wanted(stale, live_only=True, now=self.NOW))
+        self.assertTrue(reviewer.wanted(stale, now=self.NOW))
+        self.assertTrue(reviewer.wanted(no_expiry, live_only=True, now=self.NOW))  # reviewer must set one
+        self.assertFalse(reviewer.wanted(no_expiry, types={'injury', 'rotation'}))
+        self.assertTrue(reviewer.wanted(live, live_only=True, types={'injury'}, now=self.NOW))
+
+    def test_expiry_exactly_now_is_not_live(self):
+        self.assertFalse(reviewer.wanted({'claim_type': 'injury', 'valid_until': '2026-10-12T00:00:00Z'},
+                                         live_only=True, now=self.NOW))
+
+
+export_rosters = load('export_rosters')
+
+
+class RosterExportTests(unittest.TestCase):
+    def test_newest_season_file_is_chosen(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for season in ('2025', '2027', '2026'):
+                (root / f'rosters_{season}.parquet').write_bytes(b'')
+            self.assertEqual(export_rosters.newest(root).name, 'rosters_2027.parquet')
+            self.assertIsNone(export_rosters.newest(root / 'missing'))
+
+    def test_up_to_date_output_is_not_rewritten(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'rosters_2027.parquet').write_bytes(b'')
+            out = root / 'out.jsonl'
+            out.write_text('kept\n')  # written after the source, so newer
+            self.assertIsNone(export_rosters.export(root, out))
+            self.assertEqual(out.read_text(), 'kept\n')
