@@ -415,3 +415,37 @@ class RosterExportTests(unittest.TestCase):
             out.write_text('kept\n')  # written after the source, so newer
             self.assertIsNone(export_rosters.export(root, out))
             self.assertEqual(out.read_text(), 'kept\n')
+
+
+class FinalizeVersionTests(unittest.TestCase):
+    def test_later_passes_get_new_versions_and_earlier_ones_are_archived(self):
+        # Invariant: exactly one finalized version per bundle stays where consumers read.
+        with tempfile.TemporaryDirectory() as d:
+            pilots = Path(d)
+            bundle = pilots / 'auto-1'
+            bundle.mkdir()
+            made = []
+
+            def fake_finalize(_bundle, _review, out):
+                out.mkdir()
+                made.append(out.name)
+
+            for _ in range(3):
+                reviewer.finalize_version(bundle, fake_finalize)
+            self.assertEqual(made, ['auto-1-reviewed', 'auto-1-reviewed-v2', 'auto-1-reviewed-v3'])
+            self.assertEqual(sorted(p.name for p in pilots.iterdir()), ['auto-1', 'auto-1-reviewed-v3', 'superseded'])
+            self.assertEqual(sorted(p.name for p in (pilots / 'superseded').iterdir()), ['auto-1-reviewed', 'auto-1-reviewed-v2'])
+
+    def test_a_failed_finalize_archives_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            pilots = Path(d)
+            (pilots / 'auto-1').mkdir()
+            (pilots / 'auto-1-reviewed').mkdir()
+
+            def failing(*_):
+                raise ValueError('bad review')
+
+            with self.assertRaises(ValueError):
+                reviewer.finalize_version(pilots / 'auto-1', failing)
+            self.assertTrue((pilots / 'auto-1-reviewed').exists())
+            self.assertFalse((pilots / 'superseded').exists())

@@ -189,6 +189,10 @@ certainty or expiry, or set an entity's model ID; `d` rejects a claim as a dupli
 related decision (same type and players, in any bundle). Unmapped entities are re-resolved against
 the current catalogue when a bundle is opened. For a backlog, `--live-only` skips entries already
 past their expiry and `--types injury,rotation` limits the session; skipped entries stay pending.
+Several bundles can be given at once (`data/pilots/auto-*`); they are reviewed newest first and
+finalized copies are skipped. A later pass finalizes to `-reviewed-v2`, `-v3`, ..., and earlier
+versions move to `data/pilots/superseded/`, kept as evidence but outside the directory consumers
+read, so the same claims are never loaded twice.
 
 The catalogue is the ESPN athlete history plus `data/vocab/espn_rosters.jsonl` (current rosters,
 re-exported by `daily.py` through `scripts/export_rosters.py` whenever the prediction model's roster

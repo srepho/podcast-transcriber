@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Review pending claim proposals in a pilot bundle from the terminal, then optionally finalize.
 
-    python3 scripts/review_claims.py data/pilots/auto-20261008T0600Z [--reviewer NAME] [--finalize]
+    python3 scripts/review_claims.py BUNDLE [BUNDLE ...] [--reviewer NAME] [--finalize]
         [--live-only] [--types injury,rotation]
+    python3 scripts/review_claims.py data/pilots/auto-* --live-only --types injury,rotation --finalize
+
+Several bundles are reviewed newest first; finalized copies (-reviewed) matched by a glob are
+skipped, and q ends the whole session after saving (and finalizing, with --finalize) the current one.
 
 --live-only skips entries whose expiry has passed (they stay pending, so they are never used);
 --types limits the session to those claim types. Skipped entries can be reviewed in a later run.
@@ -21,6 +25,7 @@ import difflib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import textwrap
@@ -200,6 +205,7 @@ def review(bundle, reviewer, read=input, catalogue=None, live_only=False, types=
             command = read("  > ").strip()
             if command == "q":
                 save(review_path, data)
+                data["quit"] = True
                 return data
             if command == "s":
                 break
@@ -213,9 +219,27 @@ def review(bundle, reviewer, read=input, catalogue=None, live_only=False, types=
     return data
 
 
+def finalize_version(bundle, finalize=None):
+    """Finalize into <bundle>-reviewed, or -reviewed-vN when earlier passes exist, then move the earlier
+    versions to pilots/superseded/: kept as evidence, but one level deeper than consumers look, so the
+    same claims are never read twice."""
+    finalize = finalize or pilot.finalize
+    base = bundle.name + "-reviewed"
+    earlier = sorted(p for p in bundle.parent.iterdir()
+                     if p.is_dir() and (p.name == base or p.name.startswith(base + "-v")))
+    version = 1 + max([1 if p.name == base else int(p.name.rsplit("-v", 1)[1]) for p in earlier], default=0)
+    out = bundle.with_name(base if version == 1 else f"{base}-v{version}")
+    finalize(bundle, bundle / "review.json", out)
+    archive = bundle.parent / "superseded"
+    for old in earlier:
+        archive.mkdir(exist_ok=True)
+        shutil.move(str(old), str(archive / old.name))
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("bundle", type=Path)
+    parser.add_argument("bundles", type=Path, nargs="+")
     parser.add_argument("--reviewer", default=os.environ.get("USER", ""))
     parser.add_argument("--finalize", action="store_true", help="Freeze the review into <bundle>-reviewed afterwards")
     parser.add_argument("--athletes", type=Path, action="append", help="Catalogue JSONL for re-mapping; repeatable")
@@ -236,16 +260,22 @@ def main():
                                               args.entity_aliases or daily.DEFAULT_ALIASES)
     except ImportError:
         pass  # re-mapping is a convenience; review works without it
-    data = review(args.bundle, args.reviewer, catalogue=catalogue, live_only=args.live_only, types=types)
-    counts = {s: sum(r["status"] == s for r in data["reviews"]) for s in ("accepted", "rejected", "pending")}
-    print(json.dumps(counts))
-    if args.finalize:
-        out = args.bundle.with_name(args.bundle.name + "-reviewed")
-        try:
-            pilot.finalize(args.bundle, args.bundle / "review.json", out)
-        except (ValueError, OSError) as error:
-            sys.exit(f"finalize failed: {error}")
-        print(f"finalized -> {out}")
+    bundles = sorted((b for b in args.bundles if (b / "candidates.jsonl").exists()), key=lambda b: b.name, reverse=True)
+    if not bundles:
+        sys.exit("no reviewable bundles (a bundle has candidates.jsonl; finalized copies do not)")
+    for bundle in bundles:
+        print(f"\n=== {bundle}")
+        data = review(bundle, args.reviewer, catalogue=catalogue, live_only=args.live_only, types=types)
+        quit_requested = data.pop("quit", False)
+        counts = {s: sum(r["status"] == s for r in data["reviews"]) for s in ("accepted", "rejected", "pending")}
+        print(json.dumps(counts))
+        if args.finalize and counts["pending"] < len(data["reviews"]):
+            try:
+                print(f"finalized -> {finalize_version(bundle)}")
+            except (ValueError, OSError) as error:
+                sys.exit(f"finalize failed for {bundle}: {error}")
+        if quit_requested:
+            break
 
 
 if __name__ == "__main__":
