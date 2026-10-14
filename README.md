@@ -53,6 +53,23 @@ podcast download && podcast transcribe                    # or: podcast run
 Backfill follows `rel="next"` feed pagination, so it finds episodes beyond the first page
 where the feed supports it.
 
+### Only some episodes of a show
+
+For a show that covers several topics, give the feed regex patterns, matched case-insensitively
+against each episode's title and show notes. Episodes that fail them are recorded as `skipped` and
+never downloaded, on refresh and on `backfill` alike:
+
+```bash
+podcast add https://example.com/feed.rss --name allsports \
+  --include '\bNBA\b([^ ]| [^2]|$)|\b(Celtics|Lakers|Knicks)\b' \
+  --exclude '\b(AFC|NFC) Over/Unders\b' \
+  --prompt "A sports podcast that often covers the NBA."
+```
+
+The `([^ ]| [^2]|$)` tail keeps "NBA" but skips a sponsor's "NBA 2K" in the show notes. Test a
+pattern with `podcast backfill <feed> --since <date> --dry-run` before relying on it. Mixed episodes
+still contain other topics and ads; the optional LLM extractor removes those (`docs/RESEARCH_PILOT.md`).
+
 ## Getting names right
 
 Generic speech-to-text mangles proper nouns ("Yokic", "Antetokumpo", "Sean Sharani").
@@ -152,6 +169,8 @@ feeds:
     url: https://...
     enabled: true
     prompt: "An NBA podcast hosted by Jane Host and Sam Cohost."
+    include: null              # optional regex: only queue episodes whose title/notes match
+    exclude: null              # optional regex: never queue episodes whose title/notes match
 ```
 
 ## Scheduling on macOS

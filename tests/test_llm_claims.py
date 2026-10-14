@@ -237,8 +237,8 @@ class ProviderTests(unittest.TestCase):
                     {'index': 1, 'segment_id': 'e:1', 'start_secs': 1.0, 'end_secs': 2.0, 'raw_text': 'b', 'corrected_text': 'b'}]
         args = ('e', 'sha', 'Show', '2024-03-01T00:00:00Z', segments, llm.Catalogue({}), lambda v: json.dumps(v), pilot.timestamp,
                 lambda _: {'claims': [claim()]})
-        one, _ = llm.episode_candidates(*args, 'deepseek:m1')
-        two, _ = llm.episode_candidates(*args, 'qwen:m1')
+        one, _, _ = llm.episode_candidates(*args, 'deepseek:m1')
+        two, _, _ = llm.episode_candidates(*args, 'qwen:m1')
         self.assertEqual(one[0]['extractor_model'], 'deepseek:m1')
         self.assertNotEqual(one[0]['candidate_id'], two[0]['candidate_id'])
 
@@ -497,3 +497,65 @@ class ClaimsFeedTests(ClaudeBundleTests):
             pilot.build(self.root, 'demo', 'Show 3', 1, self.root / 'keyword')  # keyword extractor, Jan episode
         _, rows, _ = self.export()
         self.assertEqual({r['bundle'] for r in rows}, {'auto1'})
+
+
+class SectionTests(unittest.TestCase):
+    SEGMENTS = [{'index': i, 'segment_id': f'e:{i}', 'start_secs': float(i), 'end_secs': i + 1.0,
+                 'raw_text': f'seg {i}', 'corrected_text': f'seg {i}'} for i in range(10)]
+
+    def run_episode(self, sections, claims):
+        prompts = []
+
+        def extract(prompt):
+            prompts.append(prompt)
+            return {'claims': claims}
+        result = llm.episode_candidates('e', 'sha', 'Show', '2024-03-01T00:00:00Z', self.SEGMENTS, llm.Catalogue({}),
+                                        lambda v: json.dumps(v), pilot.timestamp, extract, 'x:m',
+                                        lambda _: {'sections': sections})
+        return (*result, prompts)
+
+    def test_only_nba_segments_are_sent_with_original_numbers(self):
+        # Invariant: ads and other topics never reach extraction; kept segments keep their numbers.
+        sections = [{'start': 0, 'end': 2, 'kind': 'ad'}, {'start': 3, 'end': 6, 'kind': 'nba'},
+                    {'start': 7, 'end': 9, 'kind': 'other_sport'}]
+        _, _, runs, prompts = self.run_episode(sections, [])
+        self.assertIn('[3] seg 3', prompts[0])
+        self.assertNotIn('[0] seg 0', prompts[0])
+        self.assertNotIn('[8] seg 8', prompts[0])
+        self.assertEqual(runs, [{'start_index': 0, 'end_index': 2, 'kind': 'ad'},
+                                {'start_index': 3, 'end_index': 6, 'kind': 'nba'},
+                                {'start_index': 7, 'end_index': 9, 'kind': 'other_sport'}])
+
+    def test_claims_must_start_and_end_in_nba_segments(self):
+        sections = [{'start': 0, 'end': 4, 'kind': 'nba'}, {'start': 5, 'end': 9, 'kind': 'ad'}]
+        found, _, _, _ = self.run_episode(sections, [claim(1, 3), claim(3, 6), claim(6, 7)])
+        self.assertEqual([c['segment_ids'] for c in found], [['e:1', 'e:2', 'e:3']])
+
+    def test_no_nba_content_makes_no_extraction_request(self):
+        found, reviews, runs, prompts = self.run_episode([{'start': 0, 'end': 9, 'kind': 'other_sport'}], [claim()])
+        self.assertEqual((found, reviews, prompts), ([], [], []))
+        self.assertEqual(runs, [{'start_index': 0, 'end_index': 9, 'kind': 'other_sport'}])
+
+    def test_uncovered_or_invalid_ranges_stay_nba(self):
+        kinds = llm.segment_kinds({'sections': [{'start': 2, 'end': 3, 'kind': 'ad'}, {'start': 8, 'end': 99, 'kind': 'non_sport'},
+                                                {'start': 5, 'end': 4, 'kind': 'ad'}, {'start': 0, 'end': 1, 'kind': 'weather'}]}, 10)
+        self.assertEqual(kinds, ['nba', 'nba', 'ad', 'ad', 'nba', 'nba', 'nba', 'nba', 'non_sport', 'non_sport'])
+
+    def test_bundle_records_the_section_map(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = root / 'ep.json'
+            source.write_text(json.dumps({'guid': 'g', 'feed': 'demo', 'model': 'base.en', 'segments': [
+                {'start': float(i), 'end': i + 1.0, 'text': f'seg {i}'} for i in range(4)]}))
+            with closing(sqlite3.connect(root / 'podcast.db')) as db, db:
+                db.execute('CREATE TABLE episodes (guid TEXT, feed_name TEXT, title TEXT, published TEXT, '
+                           'status TEXT, transcript_path TEXT)')
+                db.execute('INSERT INTO episodes VALUES (?,?,?,?,?,?)',
+                           ('g', 'demo', 'Show', '2024-03-01T00:00:00Z', 'transcribed', str(source)))
+            with patch.object(pilot, 'now', return_value='2024-03-03T00:00:00+00:00'):
+                manifest = pilot.build(root, 'demo', '', 1, root / 'b', extractor='llm', catalogue=llm.Catalogue({}),
+                                       call=lambda _: {'claims': []},
+                                       sections_call=lambda _: {'sections': [{'start': 0, 'end': 1, 'kind': 'ad'}]})
+            self.assertEqual(manifest['counts']['sections.jsonl'], 2)
+            self.assertEqual([r['kind'] for r in pilot.read_rows(root / 'b' / 'sections.jsonl')], ['ad', 'nba'])
+            self.assertEqual(manifest['extractor_version'], 'llm-claims-v2')

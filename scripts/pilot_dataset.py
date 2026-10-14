@@ -107,7 +107,7 @@ def extracted_path(data_dir):
 
 
 def build(data_dir, feed, title, limit, out, extractor="keyword", unprocessed=False, published_after=None,
-          catalogue=None, call=None, provider="anthropic", model=None, base_url=None):
+          catalogue=None, call=None, provider="anthropic", model=None, base_url=None, sections_call=None):
     """Export a review bundle. `unprocessed` selects transcribed episodes not yet extracted by any earlier
     unprocessed build (tracked in pilots/extracted.json) and returns None when there are none."""
     if not 1 <= limit <= 10:
@@ -151,7 +151,7 @@ def build(data_dir, feed, title, limit, out, extractor="keyword", unprocessed=Fa
             if line:
                 terms.append(line.split("=>")[-1].strip())
     term_patterns = [(term, re.compile(r"(?<!\w)" + re.escape(term) + r"(?!\w)", re.I)) for term in set(terms)]
-    episode_rows, segments, candidates, reviews = [], [], [], []
+    episode_rows, segments, candidates, reviews, sections = [], [], [], [], []
     for ep in episodes:
         episode_id = digest(encoded([feed, ep["guid"]]))
         row = {"schema_version": SCHEMA_VERSION, "episode_id": episode_id,
@@ -211,18 +211,24 @@ def build(data_dir, feed, title, limit, out, extractor="keyword", unprocessed=Fa
             if llm is not None:
                 episode_segments = [s for s in segments if s["episode_id"] == episode_id]
                 try:
-                    found, proposed = llm.episode_candidates(
+                    # Production sections every transcript; a test passing its own `call` opts in explicitly.
+                    labeller = sections_call if call is not None else engine.sections
+                    found, proposed, episode_sections = llm.episode_candidates(
                         episode_id, row["transcript_sha256"], ep["title"], row["published_at"], episode_segments,
                         catalogue, lambda value: digest(encoded(value)), timestamp,
-                        call if call is not None else engine, engine.name)
+                        call if call is not None else engine, engine.name, labeller)
                 except Exception as error:  # one failed episode must not discard the others; it is retried later
                     failures.append({"episode_id": episode_id, "error": f"{type(error).__name__}: {error}"})
                     row["audit_status"] = "extraction_failed"
                 else:
                     candidates += [{"schema_version": SCHEMA_VERSION, **c} for c in found]
                     reviews += proposed
+                    sections += [{"schema_version": SCHEMA_VERSION, "episode_id": episode_id, **s}
+                                 for s in episode_sections]
         episode_rows.append(row)
     files = {"episodes.jsonl": episode_rows, "segments.jsonl": segments, "candidates.jsonl": candidates}
+    if llm is not None:
+        files["sections.jsonl"] = sections  # which stretches were NBA, other sport, non-sport or ads
     with new_directory(out) as staging:
         for name, rows in files.items():
             write_rows(staging / name, rows)

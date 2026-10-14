@@ -270,6 +270,8 @@ mod tests {
             url: "https://example.com/feed".into(),
             enabled: true,
             prompt: None,
+            include: None,
+            exclude: None,
         };
         assert_eq!(
             crate::pipeline::ingest(&db, &feed, &first, 3)

@@ -85,6 +85,8 @@ pub struct RefreshReport {
     pub feed: String,
     pub queued: usize,
     pub skipped: usize,
+    /// New episodes not queued because the feed's include/exclude patterns rejected them.
+    pub filtered: usize,
     pub total_in_feed: usize,
 }
 
@@ -112,8 +114,10 @@ fn to_episode(feed: &Feed, e: &FeedEpisode, status: Status) -> Episode {
 pub fn ingest(db: &Db, feed: &Feed, parsed: &ParsedFeed, max_new: usize) -> Result<RefreshReport> {
     let first_time = db.feed_count(&feed.name)? == 0;
     let latest_known = db.latest_published(&feed.name)?;
+    let filter = feed.episode_filter()?;
     let mut queued = 0;
     let mut skipped = 0;
+    let mut filtered = 0;
     // parsed.episodes is newest-first.
     for (i, e) in parsed.episodes.iter().enumerate() {
         let queue = match (first_time, e.published, latest_known) {
@@ -121,10 +125,16 @@ pub fn ingest(db: &Db, feed: &Feed, parsed: &ParsedFeed, max_new: usize) -> Resu
             (false, Some(published), Some(latest)) => published > latest,
             (false, _, _) => i < max_new,
         };
-        let status = if queue { Status::New } else { Status::Skipped };
+        let wanted = filter.wants(&e.title, &e.description);
+        let status = if queue && wanted {
+            Status::New
+        } else {
+            Status::Skipped
+        };
         if db.insert(&to_episode(feed, e, status))? {
-            match status {
-                Status::New => queued += 1,
+            match (status, queue) {
+                (Status::New, _) => queued += 1,
+                (_, true) => filtered += 1,
                 _ => skipped += 1,
             }
         }
@@ -140,6 +150,7 @@ pub fn ingest(db: &Db, feed: &Feed, parsed: &ParsedFeed, max_new: usize) -> Resu
         feed: feed.name.clone(),
         queued,
         skipped,
+        filtered,
         total_in_feed: parsed.episodes.len(),
     })
 }
@@ -226,6 +237,14 @@ pub fn select_backfill(db: &Db, feed_name: &str, filter: &BackfillFilter) -> Res
     Ok(eps)
 }
 
+/// Skipped episodes `backfill` would promote: the backfill filter, then the feed's include/exclude.
+pub fn backfill_candidates(db: &Db, feed: &Feed, filter: &BackfillFilter) -> Result<Vec<Episode>> {
+    let wanted = feed.episode_filter()?;
+    let mut selected = select_backfill(db, &feed.name, filter)?;
+    selected.retain(|e| wanted.wants(&e.title, &e.description));
+    Ok(selected)
+}
+
 /// Discover the feed's full history (following pagination), record unknown episodes as skipped,
 /// then promote matching skipped episodes to `new`. Returns the promoted episodes.
 pub fn backfill(
@@ -250,7 +269,7 @@ pub fn backfill(
     if discovered > 0 {
         eprintln!("  discovered {discovered} previously unseen episodes");
     }
-    let selected = select_backfill(db, &feed.name, filter)?;
+    let selected = backfill_candidates(db, feed, filter)?;
     if !dry_run {
         for e in &selected {
             db.set_status(&e.feed_name, &e.guid, Status::New, None)?;
@@ -798,6 +817,8 @@ mod tests {
             url: "https://x/rss".into(),
             enabled: true,
             prompt: None,
+            include: None,
+            exclude: None,
         }
     }
 
@@ -818,6 +839,77 @@ mod tests {
             episodes,
             next_page: None,
         }
+    }
+
+    /// A feed whose episodes 2, 4, 6, ... are about basketball (in the title or only the notes).
+    fn mixed(n: usize) -> ParsedFeed {
+        let mut p = parsed(n);
+        for e in &mut p.episodes {
+            let i: usize = e.guid[3..].parse().unwrap();
+            if i % 4 == 2 {
+                e.title = format!("NBA Over/Unders {i}");
+            } else if i.is_multiple_of(4) {
+                e.description = format!("(1:40:00) NBA catch-up, part {i}");
+            } else {
+                e.description = "Sponsored by NBA 2K27.".into();
+            }
+        }
+        p
+    }
+
+    fn filtered_feed() -> Feed {
+        Feed {
+            include: Some(r"\bnba\b([^ ]| [^2]|$)".into()), // "NBA" but not the "NBA 2K" ad read
+            ..feed()
+        }
+    }
+
+    #[test]
+    fn include_pattern_keeps_matching_episodes_from_title_or_notes() {
+        // Invariant: an unwanted episode is never queued; it is counted as filtered, not as backlog.
+        let db = Db::open_memory().unwrap();
+        let r = ingest(&db, &filtered_feed(), &mixed(8), 4).unwrap();
+        assert_eq!((r.queued, r.filtered, r.skipped), (2, 2, 4)); // newest four: 8 6 queued, 7 5 filtered
+        let new: Vec<_> = db
+            .list(Some(Status::New), None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.guid)
+            .collect();
+        assert_eq!(new, ["ep-6", "ep-8"]);
+        // Later episodes: wanted ones queue, unwanted ones are filtered (no backlog warning).
+        let r = ingest(&db, &filtered_feed(), &mixed(12), 4).unwrap();
+        assert_eq!((r.queued, r.filtered, r.skipped), (2, 2, 0));
+    }
+
+    #[test]
+    fn exclude_wins_over_include_and_bad_patterns_are_rejected() {
+        let db = Db::open_memory().unwrap();
+        let both = Feed {
+            exclude: Some("over/unders".into()),
+            ..filtered_feed()
+        };
+        let r = ingest(&db, &both, &mixed(4), 4).unwrap();
+        assert_eq!((r.queued, r.filtered), (1, 3)); // ep-4 (notes) only; ep-2 is an Over/Unders title
+        let bad = Feed {
+            include: Some("(".into()),
+            ..feed()
+        };
+        assert!(ingest(&db, &bad, &mixed(4), 4).is_err());
+    }
+
+    #[test]
+    fn backfill_honours_the_feed_filter() {
+        let db = Db::open_memory().unwrap();
+        ingest(&db, &filtered_feed(), &mixed(8), 0).unwrap(); // everything recorded as skipped
+        let all = BackfillFilter::default();
+        let picked: Vec<_> = backfill_candidates(&db, &filtered_feed(), &all)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.guid)
+            .collect();
+        assert_eq!(picked, ["ep-8", "ep-6", "ep-4", "ep-2"]);
+        assert_eq!(backfill_candidates(&db, &feed(), &all).unwrap().len(), 8);
     }
 
     #[test]

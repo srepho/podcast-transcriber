@@ -152,11 +152,12 @@ rules and a separate validation policy.
 
 ## Scheduled collection and LLM-proposed claims
 
-`scripts/daily.py FEED PUBLISHED_AFTER` runs `podcast run` (refresh, download, transcribe) and then
+`scripts/daily.py FEED[,FEED...] PUBLISHED_AFTER` runs `podcast run` (refresh, download, transcribe for
+every feed) and then, for each listed feed, the equivalent of
 
 ```sh
 python scripts/pilot_dataset.py build --feed FEED --unprocessed --published-after 2026-10-01T00:00:00Z \
-  --extractor llm --provider anthropic --athletes athletes.jsonl --out data/pilots/auto-<UTC stamp>
+  --extractor llm --provider anthropic --athletes athletes.jsonl --out data/pilots/auto-FEED-<UTC stamp>
 ```
 
 `--unprocessed` selects transcribed episodes published after the floor that no earlier unprocessed
@@ -164,8 +165,12 @@ build has extracted (`data/pilots/extracted.json`), and writes nothing when ther
 whose extraction fails stays in the bundle as `extraction_failed`, is listed in the manifest's
 `extraction_failures`, and is retried by the next run.
 
-The LLM extractor (`scripts/llm_claims.py`, `uv sync --group extract`) makes one structured-output
-request per transcript and turns each proposed claim into an ordinary candidate whose review entry
+The LLM extractor (`scripts/llm_claims.py`, `uv sync --group extract`) first labels each transcript
+(one request) as contiguous sections of `nba`, `other_sport`, `non_sport` or `ad` (sponsor reads,
+promotions, betting disclaimers), stored per episode in the bundle's `sections.jsonl`. Only `nba`
+segments, with their original numbers, are sent for extraction; a claim must start and end inside
+them, segments no section covers stay `nba`, and an episode without NBA content makes no extraction
+request. It then makes one structured-output request per transcript and turns each proposed claim into an ordinary candidate whose review entry
 is pre-filled but still `pending`: claim text, type, certainty, temporal scope, entities, and an
 expiry of publication plus a fixed per-type window (`EXPIRY_DAYS`). Proposals citing segments that
 do not exist, spans longer than `MAX_SPAN`, or invalid labels are dropped, never repaired. Entity IDs

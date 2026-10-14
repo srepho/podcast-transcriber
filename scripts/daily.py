@@ -3,7 +3,10 @@
 claims for episodes not yet extracted, into a new pending bundle under data/pilots/auto-<UTC stamp>.
 Nothing reaches a model until a person reviews and finalizes the bundle (scripts/review_claims.py).
 
-    .venv/bin/python scripts/daily.py FEED PUBLISHED_AFTER     e.g. myshow 2026-10-01T00:00:00Z
+    .venv/bin/python scripts/daily.py FEED[,FEED...] PUBLISHED_AFTER     e.g. myshow,othershow 2026-10-01T00:00:00Z
+
+Every listed feed is extracted into its own bundle, data/pilots/auto-<feed>-<UTC stamp>; a failure on
+one feed does not stop the others.
 
 PROVIDER (default anthropic), MODEL (required except for anthropic) and BASE_URL choose the extractor.
 The provider's key comes from its usual environment variable, the login keychain (service
@@ -104,7 +107,7 @@ def main(argv=None):
 
 def run(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("feed")
+    parser.add_argument("feeds", help="Comma-separated feed names")
     parser.add_argument("published_after")
     parser.add_argument("--provider", default=os.environ.get("PROVIDER", "anthropic"))
     parser.add_argument("--model", default=os.environ.get("MODEL"))
@@ -131,25 +134,31 @@ def run(argv=None):
         return 1
     if not args.athletes:
         refresh_rosters()
-    out = REPO / "data/pilots" / f"auto-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%MZ')}"
-    log(f"extract with {args.provider}:{args.model or 'default'} -> {out.relative_to(REPO)}")
-    try:
-        manifest = pilot_dataset.build(
-            REPO / "data", args.feed, "", 10, out, extractor="llm", unprocessed=True,
-            published_after=args.published_after,
-            catalogue=llm_claims.Catalogue.load(args.athletes or DEFAULT_ATHLETES, args.entity_aliases),
-            provider=args.provider, model=args.model, base_url=args.base_url)
-    except Exception as error:  # the log and a notification are the only places a scheduled failure shows
-        print(f"extraction failed: {type(error).__name__}: {error}", file=sys.stderr)
-        notify("Claim extraction failed; see ~/Library/Logs/podcast/daily.log")
-        return 1
-    if manifest is None:
-        log("no new episodes")
-        return 0
-    text = summary(manifest)
-    log(text)
-    notify(f"{text} to review: scripts/review_claims.py {out.relative_to(REPO)} --finalize")
-    return 0
+    catalogue = llm_claims.Catalogue.load(args.athletes or DEFAULT_ATHLETES, args.entity_aliases)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%MZ")
+    failed, made = [], []
+    for feed in [f.strip() for f in args.feeds.split(",") if f.strip()]:
+        out = REPO / "data/pilots" / f"auto-{feed}-{stamp}"
+        log(f"extract {feed} with {args.provider}:{args.model or 'default'} -> {out.relative_to(REPO)}")
+        try:
+            manifest = pilot_dataset.build(
+                REPO / "data", feed, "", 10, out, extractor="llm", unprocessed=True,
+                published_after=args.published_after, catalogue=catalogue,
+                provider=args.provider, model=args.model, base_url=args.base_url)
+        except Exception as error:  # the log and a notification are the only places a scheduled failure shows
+            print(f"extraction failed for {feed}: {type(error).__name__}: {error}", file=sys.stderr)
+            failed.append(feed)
+            continue
+        if manifest is None:
+            log(f"{feed}: no new episodes")
+            continue
+        made.append(f"{feed}: {summary(manifest)}")
+        log(made[-1])
+    if failed:
+        notify(f"Claim extraction failed for {', '.join(failed)}; see ~/Library/Logs/podcast/daily.log")
+    if made:
+        notify("; ".join(made) + " (scripts/review_claims.py data/pilots/auto-* --finalize)")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

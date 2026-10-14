@@ -45,6 +45,15 @@ enum Cmd {
         /// Short name used in paths and other commands (default: derived from feed title).
         #[arg(short, long)]
         name: Option<String>,
+        /// Only queue episodes whose title or show notes match this regex (case-insensitive).
+        #[arg(long)]
+        include: Option<String>,
+        /// Never queue episodes whose title or show notes match this regex (case-insensitive).
+        #[arg(long)]
+        exclude: Option<String>,
+        /// Whisper context for this show (hosts, topic).
+        #[arg(long)]
+        prompt: Option<String>,
     },
     /// Unsubscribe from a feed and forget its episodes (audio/transcripts on disk are kept).
     Remove { name: String },
@@ -193,7 +202,13 @@ fn run() -> Result<()> {
             }
         }
 
-        Cmd::Add { url, name } => {
+        Cmd::Add {
+            url,
+            name,
+            include,
+            exclude,
+            prompt,
+        } => {
             let client = http::client(settings.feed_timeout_secs)?;
             let parsed = feeds::fetch(&client, &url)?;
             let name = name.unwrap_or_else(|| download::slug(&parsed.title, 40).to_lowercase());
@@ -204,15 +219,26 @@ fn run() -> Result<()> {
                 name: name.clone(),
                 url,
                 enabled: true,
-                prompt: None,
+                prompt,
+                include,
+                exclude,
             };
+            feed.episode_filter()?; // reject a bad pattern before touching the database
             let db = Db::open(&settings.db_path())?;
             let r = pipeline::ingest(&db, &feed, &parsed, settings.max_new_per_feed)?;
             settings.feeds.push(feed);
             settings.save(&cli.config)?;
             println!(
-                "added '{name}' ({}): {} episodes in feed, {} queued, {} older recorded as skipped",
-                parsed.title, r.total_in_feed, r.queued, r.skipped
+                "added '{name}' ({}): {} episodes in feed, {} queued, {} older recorded as skipped{}",
+                parsed.title,
+                r.total_in_feed,
+                r.queued,
+                r.skipped,
+                if r.filtered > 0 {
+                    format!(", {} filtered out by include/exclude", r.filtered)
+                } else {
+                    String::new()
+                }
             );
             if r.skipped > 0 {
                 println!("  to get history: podcast backfill {name} --all   (or --limit N / --since YYYY-MM-DD)");
@@ -260,11 +286,16 @@ fn run() -> Result<()> {
             let batch = pipeline::refresh(&settings, &db, feed.as_deref())?;
             for r in &batch.value {
                 println!(
-                    "{:<24} {} new{}",
+                    "{:<24} {} new{}{}",
                     r.feed,
                     r.queued,
                     if r.skipped > 0 {
                         format!(", {} older skipped", r.skipped)
+                    } else {
+                        String::new()
+                    },
+                    if r.filtered > 0 {
+                        format!(", {} filtered out", r.filtered)
                     } else {
                         String::new()
                     }

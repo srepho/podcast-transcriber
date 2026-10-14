@@ -16,6 +16,50 @@ pub struct Feed {
     /// and Sam Cohost."). Combined with the episode title and vocabulary at transcription time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Only queue episodes whose title or show notes match this regex (case-insensitive), e.g. to
+    /// take just the basketball episodes of a multi-sport show. Non-matching ones are recorded as
+    /// skipped and never downloaded; `backfill` honours it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include: Option<String>,
+    /// Never queue episodes whose title or show notes match this regex (case-insensitive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<String>,
+}
+
+/// A feed's compiled include/exclude patterns.
+#[derive(Debug, Clone, Default)]
+pub struct EpisodeFilter {
+    include: Option<regex::Regex>,
+    exclude: Option<regex::Regex>,
+}
+
+impl EpisodeFilter {
+    /// Whether an episode with this title and show notes should be queued.
+    pub fn wants(&self, title: &str, description: &str) -> bool {
+        let text = format!("{title}\n{description}");
+        self.include.as_ref().is_none_or(|r| r.is_match(&text))
+            && !self.exclude.as_ref().is_some_and(|r| r.is_match(&text))
+    }
+}
+
+impl Feed {
+    pub fn episode_filter(&self) -> Result<EpisodeFilter> {
+        let compile = |pattern: &Option<String>, field: &str| -> Result<Option<regex::Regex>> {
+            pattern
+                .as_deref()
+                .map(|p| {
+                    regex::RegexBuilder::new(p)
+                        .case_insensitive(true)
+                        .build()
+                        .with_context(|| format!("feed '{}': invalid {field} pattern", self.name))
+                })
+                .transpose()
+        };
+        Ok(EpisodeFilter {
+            include: compile(&self.include, "include")?,
+            exclude: compile(&self.exclude, "exclude")?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -160,6 +204,8 @@ mod tests {
             url: "https://example.com/rss".into(),
             enabled: true,
             prompt: None,
+            include: None,
+            exclude: None,
         });
         let text = serde_yaml::to_string(&s).unwrap();
         let back: Settings = serde_yaml::from_str(&text).unwrap();

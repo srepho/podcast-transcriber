@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 EFFORT = "medium"  # Anthropic only
-EXTRACTOR_VERSION = "llm-claims-v1"
+EXTRACTOR_VERSION = "llm-claims-v2"  # v2: transcripts are sectioned first; only NBA stretches are read
 # Base URLs are the providers' documented OpenAI-compatible endpoints; override with base_url when a
 # provider moves or for another region. Non-Anthropic models must be named explicitly: model lists
 # change faster than this file, and a silent default would make bundles hard to compare.
@@ -104,6 +104,35 @@ SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+SECTION_KINDS = ["nba", "other_sport", "non_sport", "ad"]
+SECTION_SYSTEM = """You label the parts of a podcast transcript so that only NBA basketball discussion is \
+kept. The transcript is machine speech-to-text split into numbered segments.
+
+Cover the whole transcript, in order, with contiguous sections; each is a range of segment numbers \
+(start and end inclusive) with one kind:
+- nba: discussion of NBA basketball (teams, players, coaches, trades, contracts, injuries, the league).
+- other_sport: any other sport, including the NFL, MLB, college sports, soccer and the WNBA.
+- non_sport: movies, TV, music, comedy, personal life, show business and anything else.
+- ad: sponsor reads, promotions for other shows or products, betting promotions and responsible-gambling \
+disclaimers, and listener-support appeals.
+Use few, long sections: switch kind only when the topic really changes, and fold brief asides into the \
+surrounding section. When NBA talk and something else are mixed, label it nba."""
+
+SECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"sections": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"start": {"type": "integer"}, "end": {"type": "integer"},
+                       "kind": {"type": "string", "enum": SECTION_KINDS}},
+        "required": ["start", "end", "kind"], "additionalProperties": False}}},
+    "required": ["sections"],
+    "additionalProperties": False,
+}
+
+# One request shape per task: (system prompt, schema, schema name).
+TASKS: dict[str, tuple[str, dict[str, Any], str]] = {
+    "claims": (SYSTEM, SCHEMA, "claims"), "sections": (SECTION_SYSTEM, SECTION_SCHEMA, "sections")}
+
 # ESPN team ids, as used by the prediction model (`espn:team:<id>`).
 TEAMS = {
     1: "Atlanta Hawks", 2: "Boston Celtics", 3: "New Orleans Pelicans", 4: "Chicago Bulls", 5: "Cleveland Cavaliers",
@@ -143,12 +172,19 @@ class Extractor:
             "format": self.format, "base_url": self.base_url, "options": spec.get("options", {}),
             "max_tokens": spec.get("max_tokens", OUTPUT_TOKENS)}
         return {"provider": self.provider, "model": self.model, **settings, "version": EXTRACTOR_VERSION, "system": SYSTEM,
-                "schema": SCHEMA, "expiry_days": EXPIRY_DAYS, "max_span": MAX_SPAN}
+                "schema": SCHEMA, "section_system": SECTION_SYSTEM, "section_schema": SECTION_SCHEMA,
+                "expiry_days": EXPIRY_DAYS, "max_span": MAX_SPAN}
+
+    def request(self, prompt: str, task: str) -> dict[str, Any]:
+        if self.provider == "anthropic":
+            return anthropic_call(prompt, self.model, task)
+        return openai_call(prompt, self, task)
 
     def __call__(self, prompt: str) -> dict[str, Any]:
-        if self.provider == "anthropic":
-            return anthropic_call(prompt, self.model)
-        return openai_call(prompt, self)
+        return self.request(prompt, "claims")
+
+    def sections(self, prompt: str) -> dict[str, Any]:
+        return self.request(prompt, "sections")
 
 
 def name_key(name: str) -> str:
@@ -240,18 +276,19 @@ def transcript_prompt(title: str, published: str | None, segments: list[dict[str
     return "\n".join(lines)
 
 
-def anthropic_call(prompt: str, model: str) -> dict[str, Any]:
+def anthropic_call(prompt: str, model: str, task: str = "claims") -> dict[str, Any]:
     """One streamed structured-output request. Imported lazily so the pilot stays stdlib-only.
 
     Server-side fallbacks are on: if the model declines (refusal), the API retries on a fallback model."""
     import anthropic
 
+    system, schema, _ = TASKS[task]
     client = anthropic.Anthropic()
-    output_config: Any = {"effort": EFFORT, "format": {"type": "json_schema", "schema": SCHEMA}}
+    output_config: Any = {"effort": EFFORT, "format": {"type": "json_schema", "schema": schema}}
     with client.beta.messages.stream(
         model=model,
         max_tokens=32000,
-        system=SYSTEM,
+        system=system,
         messages=[{"role": "user", "content": prompt}],
         output_config=output_config,
         betas=["server-side-fallback-2026-07-01"],
@@ -276,14 +313,14 @@ def parse_json(text: str) -> dict[str, Any]:
     return data
 
 
-def openai_messages(prompt: str, mode: str) -> list[dict[str, str]]:
-    system = SYSTEM
+def openai_messages(prompt: str, mode: str, task: str = "claims") -> list[dict[str, str]]:
+    system, schema, _ = TASKS[task]
     if mode == "json_object":  # no server-side schema: state it, then validate the reply
-        system += "\n\nReply with only a JSON object that matches this JSON Schema:\n" + json.dumps(SCHEMA)
+        system += "\n\nReply with only a JSON object that matches this JSON Schema:\n" + json.dumps(schema)
     return [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
 
 
-def openai_call(prompt: str, extractor: Extractor) -> dict[str, Any]:
+def openai_call(prompt: str, extractor: Extractor, task: str = "claims") -> dict[str, Any]:
     """Chat Completions request for OpenAI and OpenAI-compatible providers."""
     from openai import OpenAI
 
@@ -293,13 +330,14 @@ def openai_call(prompt: str, extractor: Extractor) -> dict[str, Any]:
     client = OpenAI(api_key=key, base_url=extractor.base_url)
     spec = PROVIDERS[extractor.provider]
     output_tokens = spec.get("max_tokens", OUTPUT_TOKENS)
+    _, schema, schema_name = TASKS[task]
     if extractor.format == "json_schema":
         response_format: dict[str, Any] = {"type": "json_schema",
-                                           "json_schema": {"name": "claims", "schema": SCHEMA, "strict": True}}
+                                           "json_schema": {"name": schema_name, "schema": schema, "strict": True}}
         limits = {"max_completion_tokens": output_tokens}
     else:
         response_format, limits = {"type": "json_object"}, {"max_tokens": output_tokens}
-    request: dict[str, Any] = {"model": extractor.model, "messages": openai_messages(prompt, extractor.format),
+    request: dict[str, Any] = {"model": extractor.model, "messages": openai_messages(prompt, extractor.format, task),
                                "response_format": response_format, **limits, **spec.get("options", {})}
     response = client.chat.completions.create(**request)
     choice = response.choices[0]
@@ -326,13 +364,45 @@ def proposals(response: dict[str, Any], n_segments: int) -> list[dict[str, Any]]
     return out
 
 
+def segment_kinds(response: dict[str, Any], n_segments: int) -> list[str]:
+    """Kind of every segment. Ranges are clipped to the transcript; invalid ones are ignored; a segment
+    no section covers stays `nba`, so a sloppy labelling can never silently drop basketball talk."""
+    kinds = ["nba"] * n_segments
+    for section in response.get("sections", []):
+        start, end, kind = section.get("start"), section.get("end"), section.get("kind")
+        if isinstance(start, int) and isinstance(end, int) and kind in SECTION_KINDS and start <= end:
+            for i in range(max(0, start), min(n_segments - 1, end) + 1):
+                kinds[i] = kind
+    return kinds
+
+
+def runs(kinds: list[str]) -> list[dict[str, Any]]:
+    """Contiguous runs of one kind, as stored in the bundle's sections.jsonl."""
+    out: list[dict[str, Any]] = []
+    for i, kind in enumerate(kinds):
+        if out and out[-1]["kind"] == kind:
+            out[-1]["end_index"] = i
+        else:
+            out.append({"start_index": i, "end_index": i, "kind": kind})
+    return out
+
+
 def episode_candidates(
     episode_id: str, transcript_sha256: str, title: str, published: str | None, segments: list[dict[str, Any]],
     catalogue: Catalogue, digest: Callable[[Any], str], timestamp: Callable[[str], Any],
     call: Callable[[str], dict[str, Any]], extractor_name: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Pilot candidates and pre-filled (still pending) review entries for one episode."""
-    claims = proposals(call(transcript_prompt(title, published, segments)), len(segments))
+    sections_call: Callable[[str], dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Pilot candidates, pre-filled (still pending) review entries and the section map for one episode.
+
+    With `sections_call`, the transcript is first labelled (nba / other_sport / non_sport / ad) and only
+    NBA segments are sent for extraction, keeping their original numbers; a claim must start and end
+    inside NBA segments. An episode without NBA segments makes no extraction request."""
+    kinds = segment_kinds(sections_call(transcript_prompt(title, published, segments)), len(segments)) \
+        if sections_call is not None else ["nba"] * len(segments)
+    kept = [s for s, kind in zip(segments, kinds, strict=True) if kind == "nba"]
+    claims = [c for c in proposals(call(transcript_prompt(title, published, kept)), len(segments))
+              if kinds[c["segment_start"]] == "nba" and kinds[c["segment_end"]] == "nba"] if kept else []
     candidates, reviews = [], []
     for claim in claims:
         span = segments[claim["segment_start"]:claim["segment_end"] + 1]
@@ -354,5 +424,5 @@ def episode_candidates(
         reviews.append({"candidate_id": candidate_id, "status": "pending", "claim_type": claim["claim_type"],
             "claim_text": claim["claim_text"], "certainty": claim["certainty"], "temporal_scope": claim["temporal_scope"],
             "entities": entities, "valid_until": valid_until, "audio_checked": False, "notes": ""})
-    return candidates, reviews
+    return candidates, reviews, runs(kinds)
 
