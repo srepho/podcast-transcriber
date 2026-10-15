@@ -9,6 +9,9 @@ Every listed feed is extracted into its own bundle, data/pilots/auto-<feed>-<UTC
 one feed does not stop the others.
 
 PROVIDER (default anthropic), MODEL (required except for anthropic) and BASE_URL choose the extractor.
+FALLBACK_PROVIDER and FALLBACK_MODEL name a second extractor: when the first fails for any episode (or
+the whole feed), the episodes still unprocessed are extracted again with it, into
+auto-<feed>-<stamp>-<fallback provider>.
 The provider's key comes from its usual environment variable, the login keychain (service
 "podcast-<provider>"), or ENV_FILE, a dotenv file from which only that one variable is read.
 
@@ -91,6 +94,33 @@ def export_feed():
         print(f"claims feed export failed: {type(error).__name__}: {error}", file=sys.stderr)
 
 
+def extract_feed(feed, stamp, extractors, published_after, catalogue, build=None):
+    """Extract a feed's unprocessed episodes with the first extractor; while episodes fail (or the whole
+    build does), retry what is still unprocessed with the next. Returns (all succeeded, summary lines)."""
+    build = build or pilot_dataset.build
+    lines: list[str] = []
+    for attempt, (provider, model, base_url) in enumerate(extractors):
+        suffix = "" if attempt == 0 else f"-{provider}"
+        out = REPO / "data/pilots" / f"auto-{feed}-{stamp}{suffix}"
+        log(f"extract {feed} with {provider}:{model or 'default'} -> {out.relative_to(REPO)}")
+        try:
+            manifest = build(REPO / "data", feed, "", 10, out, extractor="llm", unprocessed=True,
+                             published_after=published_after, catalogue=catalogue,
+                             provider=provider, model=model, base_url=base_url)
+        except Exception as error:  # the log and a notification are the only places a scheduled failure shows
+            print(f"extraction failed for {feed} ({provider}): {type(error).__name__}: {error}", file=sys.stderr)
+            continue
+        if manifest is None:
+            if attempt == 0:
+                log(f"{feed}: no new episodes")
+            return True, lines
+        lines.append(f"{feed}: {summary(manifest)}" + (f" via {provider}" if attempt else ""))
+        log(lines[-1])
+        if not manifest["extraction_failures"]:
+            return True, lines
+    return False, lines
+
+
 def summary(manifest):
     failed = len(manifest["extraction_failures"])
     counts = manifest["counts"]
@@ -113,6 +143,8 @@ def run(argv=None):
     parser.add_argument("--model", default=os.environ.get("MODEL"))
     parser.add_argument("--base-url", default=os.environ.get("BASE_URL"))
     parser.add_argument("--env-file", default=os.environ.get("ENV_FILE"))
+    parser.add_argument("--fallback-provider", default=os.environ.get("FALLBACK_PROVIDER"))
+    parser.add_argument("--fallback-model", default=os.environ.get("FALLBACK_MODEL"))
     parser.add_argument("--athletes", type=Path, action="append",
                         help="Catalogue JSONL; repeatable (default: ESPN athletes, then data/vocab/espn_rosters.jsonl)")
     parser.add_argument("--entity-aliases", type=Path, default=DEFAULT_ALIASES)
@@ -136,24 +168,18 @@ def run(argv=None):
         refresh_rosters()
     catalogue = llm_claims.Catalogue.load(args.athletes or DEFAULT_ATHLETES, args.entity_aliases)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%MZ")
+    extractors = [(args.provider, args.model, args.base_url)]
+    if args.fallback_provider:
+        if load_key(args.fallback_provider, args.env_file):
+            extractors.append((args.fallback_provider, args.fallback_model, None))
+        else:
+            print(f"no {args.fallback_provider} API key; running without a fallback", file=sys.stderr)
     failed, made = [], []
     for feed in [f.strip() for f in args.feeds.split(",") if f.strip()]:
-        out = REPO / "data/pilots" / f"auto-{feed}-{stamp}"
-        log(f"extract {feed} with {args.provider}:{args.model or 'default'} -> {out.relative_to(REPO)}")
-        try:
-            manifest = pilot_dataset.build(
-                REPO / "data", feed, "", 10, out, extractor="llm", unprocessed=True,
-                published_after=args.published_after, catalogue=catalogue,
-                provider=args.provider, model=args.model, base_url=args.base_url)
-        except Exception as error:  # the log and a notification are the only places a scheduled failure shows
-            print(f"extraction failed for {feed}: {type(error).__name__}: {error}", file=sys.stderr)
+        ok, lines = extract_feed(feed, stamp, extractors, args.published_after, catalogue)
+        made += lines
+        if not ok:
             failed.append(feed)
-            continue
-        if manifest is None:
-            log(f"{feed}: no new episodes")
-            continue
-        made.append(f"{feed}: {summary(manifest)}")
-        log(made[-1])
     if failed:
         notify(f"Claim extraction failed for {', '.join(failed)}; see ~/Library/Logs/podcast/daily.log")
     if made:

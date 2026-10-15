@@ -162,22 +162,24 @@ class ClaudeBundleTests(unittest.TestCase):
 
 class FakeOpenAI:
     """Stands in for openai.OpenAI; records the request and returns a canned reply."""
-    reply, finish, requests = '{"claims": []}', 'stop', []
+    reply, finish, requests, no_choices = '{"claims": []}', 'stop', [], False
 
-    def __init__(self, api_key, base_url):
-        FakeOpenAI.requests.append({'api_key': api_key, 'base_url': base_url})
+    def __init__(self, api_key, base_url, **client_options):
+        FakeOpenAI.requests.append({'api_key': api_key, 'base_url': base_url, 'client': client_options})
         self.chat = self
         self.completions = self
 
     def create(self, **request):
         FakeOpenAI.requests[-1].update(request)
         message = type('M', (), {'content': FakeOpenAI.reply, 'refusal': None})
+        if FakeOpenAI.no_choices:  # what DeepSeek returned for one long transcript on 2026-10-15
+            return type('R', (), {'choices': None, 'model_extra': {'error': {'message': 'upstream timeout'}}})
         return type('R', (), {'choices': [type('C', (), {'message': message, 'finish_reason': FakeOpenAI.finish})]})
 
 
 class ProviderTests(unittest.TestCase):
     def setUp(self):
-        FakeOpenAI.reply, FakeOpenAI.finish, FakeOpenAI.requests = '{"claims": []}', 'stop', []
+        FakeOpenAI.reply, FakeOpenAI.finish, FakeOpenAI.requests, FakeOpenAI.no_choices = '{"claims": []}', 'stop', [], False
         patcher = patch.dict('sys.modules', {'openai': type('openai', (), {'OpenAI': FakeOpenAI})})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -205,6 +207,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(request['response_format']['type'], 'json_schema')
         self.assertTrue(request['response_format']['json_schema']['strict'])
         self.assertIn('max_completion_tokens', request)
+        self.assertEqual(request['client'], {'timeout': llm.REQUEST_TIMEOUT_SECS, 'max_retries': llm.REQUEST_RETRIES})
         self.assertNotIn('JSON Schema', request['messages'][0]['content'])
 
     def test_compatible_providers_get_json_mode_and_the_schema_in_the_prompt(self):
@@ -231,6 +234,15 @@ class ProviderTests(unittest.TestCase):
             FakeOpenAI.finish, FakeOpenAI.reply = 'stop', '[1, 2]'
             with self.assertRaises(ValueError):
                 llm.Extractor('moonshot', 'k')('prompt')
+
+    def test_a_reply_without_choices_is_a_clear_error(self):
+        # Bug: a 200 reply with choices=None crashed as "'NoneType' object is not subscriptable".
+        FakeOpenAI.no_choices = True
+        with patch.dict('os.environ', {'DEEPSEEK_API_KEY': 'k'}):
+            with self.assertRaisesRegex(RuntimeError, 'no choices.*upstream timeout'):
+                llm.Extractor('deepseek', 'm')('prompt')
+            with self.assertRaisesRegex(RuntimeError, 'no choices'):
+                llm.Extractor('deepseek', 'm').sections('prompt')
 
     def test_provider_and_model_are_recorded_on_every_candidate(self):
         segments = [{'index': 0, 'segment_id': 'e:0', 'start_secs': 0.0, 'end_secs': 1.0, 'raw_text': 'a', 'corrected_text': 'a'},
@@ -559,3 +571,48 @@ class SectionTests(unittest.TestCase):
             self.assertEqual(manifest['counts']['sections.jsonl'], 2)
             self.assertEqual([r['kind'] for r in pilot.read_rows(root / 'b' / 'sections.jsonl')], ['ad', 'nba'])
             self.assertEqual(manifest['extractor_version'], 'llm-claims-v2')
+
+
+class FallbackTests(unittest.TestCase):
+    """Invariant: a failing extractor never leaves episodes behind while a fallback is configured, and a
+    healthy one never triggers the fallback."""
+
+    def run_feed(self, outcomes, extractors=(('deepseek', 'm', None), ('moonshot', 'k', None))):
+        calls = []
+
+        def build(*_args, provider=None, **_kwargs):
+            calls.append(provider)
+            outcome = outcomes[len(calls) - 1]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with patch.object(daily, 'log'):
+            ok, lines = daily.extract_feed('feed', 'stamp', list(extractors), '2026-07-01T00:00:00Z', None, build)
+        return ok, lines, calls
+
+    def manifest(self, failures=0, claims=3):
+        return {'counts': {'candidates.jsonl': claims, 'episodes.jsonl': 1}, 'extraction_failures': [{}] * failures}
+
+    def test_healthy_primary_does_not_call_the_fallback(self):
+        ok, lines, calls = self.run_feed([self.manifest()])
+        self.assertEqual((ok, calls), (True, ['deepseek']))
+
+    def test_failed_episodes_are_retried_with_the_fallback(self):
+        ok, lines, calls = self.run_feed([self.manifest(failures=1), self.manifest()])
+        self.assertEqual((ok, calls), (True, ['deepseek', 'moonshot']))
+        self.assertIn('via moonshot', lines[-1])
+
+    def test_a_crashed_primary_falls_back(self):
+        ok, _, calls = self.run_feed([RuntimeError('no choices'), self.manifest()])
+        self.assertEqual((ok, calls), (True, ['deepseek', 'moonshot']))
+
+    def test_everything_failing_is_reported(self):
+        ok, _, calls = self.run_feed([self.manifest(failures=1), RuntimeError('down')])
+        self.assertFalse(ok)
+        ok, _, _ = self.run_feed([self.manifest(failures=1)], extractors=[('deepseek', 'm', None)])
+        self.assertFalse(ok)
+
+    def test_nothing_new_is_success_without_fallback(self):
+        ok, lines, calls = self.run_feed([None])
+        self.assertEqual((ok, lines, calls), (True, [], ['deepseek']))

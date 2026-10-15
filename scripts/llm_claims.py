@@ -38,11 +38,16 @@ PROVIDERS: dict[str, dict[str, Any]] = {
                  "options": {"reasoning_effort": "low"}, "max_tokens": 32000},
     "qwen": {"key_env": "DASHSCOPE_API_KEY", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
              "format": "json_object"},
-    "moonshot": {"key_env": "MOONSHOT_API_KEY", "base_url": "https://api.moonshot.ai/v1", "format": "json_object"},
+    # Kimi reasons too; at the default 16k output a full transcript ran out of room (2026-10-15).
+    "moonshot": {"key_env": "MOONSHOT_API_KEY", "base_url": "https://api.moonshot.ai/v1", "format": "json_object",
+                 "options": {"reasoning_effort": "low"}, "max_tokens": 32000},
     "zhipu": {"key_env": "ZHIPU_API_KEY", "base_url": "https://open.bigmodel.cn/api/paas/v4", "format": "json_object"},
     "compatible": {"key_env": "LLM_API_KEY", "base_url": None, "format": "json_object"},  # needs base_url
 }
 OUTPUT_TOKENS = 16000
+# Per request. A long transcript takes 1-10 minutes; on 2026-10-15 DeepSeek accepted requests and never
+# answered, and the SDK default (10 minutes, retried twice) stalled a run for half an hour per call.
+REQUEST_TIMEOUT_SECS, REQUEST_RETRIES = 600, 1
 MAX_SPAN = 15  # segments one claim may cite
 # Default feature-freshness windows, fixed before any evaluation; the reviewer may shorten them.
 EXPIRY_DAYS = {"injury": 7, "rotation": 7, "matchup": 3, "form": 14, "transaction": 30, "contract": 180}
@@ -327,7 +332,7 @@ def openai_call(prompt: str, extractor: Extractor, task: str = "claims") -> dict
     key = os.environ.get(PROVIDERS[extractor.provider]["key_env"])
     if not key:
         raise RuntimeError(f"{PROVIDERS[extractor.provider]['key_env']} is not set")
-    client = OpenAI(api_key=key, base_url=extractor.base_url)
+    client = OpenAI(api_key=key, base_url=extractor.base_url, timeout=REQUEST_TIMEOUT_SECS, max_retries=REQUEST_RETRIES)
     spec = PROVIDERS[extractor.provider]
     output_tokens = spec.get("max_tokens", OUTPUT_TOKENS)
     _, schema, schema_name = TASKS[task]
@@ -340,6 +345,11 @@ def openai_call(prompt: str, extractor: Extractor, task: str = "claims") -> dict
     request: dict[str, Any] = {"model": extractor.model, "messages": openai_messages(prompt, extractor.format, task),
                                "response_format": response_format, **limits, **spec.get("options", {})}
     response = client.chat.completions.create(**request)
+    if not response.choices:
+        # Seen from DeepSeek on a long transcript: HTTP 200 with no choices after a long wait. Report
+        # what the provider said instead of failing on the missing list.
+        detail = (getattr(response, "model_extra", None) or {}).get("error") or "no detail"
+        raise RuntimeError(f"{extractor.name} returned no choices for {task}: {detail}")
     choice = response.choices[0]
     if choice.finish_reason == "length":
         raise RuntimeError(f"{extractor.name} reply truncated at the output limit")
